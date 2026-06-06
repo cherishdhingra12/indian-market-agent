@@ -751,7 +751,7 @@ Evaluation criteria (score 1-10 for each article):
 - 3-4: Low impact (routine announcements, minor corporate news)
 - 1-2: Negligible impact (general business news, personal finance tips)
 
-Return ONLY a valid JSON array (no markdown, no code blocks, no extra text) with objects containing these EXACT fields:
+Return ONLY a valid JSON array. NO markdown, NO code blocks, NO backticks, NO explanations — just raw JSON starting with '[' and ending with ']'. Objects must have these EXACT fields:
 - "title": the article headline
 - "source": the source name
 - "url": the article URL
@@ -774,9 +774,16 @@ def analyze_articles(articles: List[Dict], config: dict) -> List[Dict]:
         log.info("LLM not configured — using keyword-based fallback scoring")
         return _keyword_score(articles, top_n)
 
+    # Two-pass approach: keyword pre-filter → LLM final ranking
+    # Pass 1: Score all articles with keywords, keep top candidates
+    pre_scored = _keyword_score(articles, 40)
+    pre_scored.sort(key=lambda x: x.get("market_impact_score", 0), reverse=True)
+    candidates = pre_scored[:30]
+
+    # Pass 2: Send only top candidates to LLM for intelligent ranking
     articles_for_prompt = [
-        {"title": a["title"], "source": a["source"], "url": a.get("url", ""), "snippet": a.get("snippet", "")[:200]}
-        for a in articles
+        {"title": a["title"], "source": a["source"], "url": a.get("url", ""), "snippet": a.get("snippet", "")[:150]}
+        for a in candidates
     ]
 
     prompt = ANALYSIS_PROMPT.format(
@@ -808,11 +815,13 @@ def analyze_articles(articles: List[Dict], config: dict) -> List[Dict]:
 
 def _parse_llm_response(response: str) -> List[Dict]:
     """Parse the LLM JSON response with multiple fallback strategies."""
-    # Strategy 1: Find JSON array in response
-    json_match = re.search(r"\[\s*\{.*?\}\s*\]", response, re.DOTALL)
+    # Strategy 1: Find JSON array in response (greedy match)
+    json_match = re.search(r"\[\s*\{.*\}\]", response, re.DOTALL)
     if json_match:
         try:
-            return json.loads(json_match.group())
+            result = json.loads(json_match.group())
+            if isinstance(result, list) and len(result) > 0:
+                return result
         except json.JSONDecodeError:
             pass
 

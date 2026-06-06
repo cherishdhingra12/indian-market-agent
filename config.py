@@ -6,9 +6,9 @@ from datetime import date
 # Gemini 2.0 Flash is free with 60 requests/minute, 1500 requests/day
 LLM_PROVIDER = "gemini"  # "gemini", "groq", "openai", "anthropic", or "none"
 LLM_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
-LLM_MODEL = "gemini-2.0-flash"
+LLM_MODEL = "gemini-2.5-flash-lite"
 LLM_TEMPERATURE = 0.2
-LLM_MAX_TOKENS = 2000
+LLM_MAX_TOKENS = 4096
 
 # ─── Telegram Configuration ───────────────────────────────────────────────────
 # 1. Create a bot at https://t.me/BotFather
