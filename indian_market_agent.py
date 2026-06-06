@@ -917,21 +917,28 @@ ANALYSIS_PROMPT = """You are an expert Indian stock market analyst tracking NSE/
 Your ONLY task: Select news that will DEFINITELY move a specific stock(s) or index TODAY or TOMORROW.
 
 RATING SCALE (market_impact_score 1-10):
-- 10: Certain large-cap stock mover. Major catalyst for Nifty 50/BSE 100 company: earnings surprise, order win, regulatory approval/revocation, buyback, acquisition, management change
-- 8-9: Strong conviction. Sector-wide catalyst (RBI policy, budget), or mid-cap company with major order/regulatory event, or insider/bulk/block deal
-- 6-7: Moderate. Small-cap specific catalyst (order win, board outcome), or macro data release (GDP, CPI, IIP), or FII/DII flow data
-- 4-5: Low conviction. General market commentary, analyst views without specific catalyst
-- 1-3: Noise. Exclude these.
+- 10: Certain large-cap mover. Major catalyst for Nifty 50/BSE 100 company: earnings surprise, blockbuster order win, regulatory approval/revocation, buyback, acquisition
+- 8-9: Strong. Sector-wide catalyst (RBI policy, budget, GST), mid-cap with major order/regulatory event, insider/bulk/block deal
+- 6-7: Moderate. Small-cap specific catalyst (order win, board outcome), macro data (GDP, CPI), FII/DII data
+- 4-5: Low conviction. Market commentary, analyst views without specific catalyst
+- 1-3: Noise. Exclude.
 
-CRITICAL RULES:
-- Name the SPECIFIC COMPANY/STOCK and the CATALYST in your "reason" field
-- NSE Filing = direct exchange filing = credible. But a routine filing for a small-cap (Rhetan, Chemfab) is less impactful than the same filing for a Nifty 50 company (Reliance, TCS, HDFC)
-- PREFER: order wins, earnings results, regulatory actions, buyback announcements, insider transactions
-- PENALIZE: general market outlook, top stocks to buy/sell, personal finance, IPO subscription status
-- PENALIZE: duplicate/overlapping stories about the same event
-- If the article title is generic (like "Share Market Today") but the snippet mentions specific stocks, rate based on the stocks mentioned
+CRITICAL RULES FOR NSE FILINGS:
+- A routine filing for a small-cap stock (e.g., Rhetan, Chemfab, GLFL) = MAX score 6, unless the news is truly exceptional (major order, regulatory approval)
+- A filing for a Nifty 50 company (Reliance, TCS, HDFC, Infosys, etc.) = score normally based on catalyst
+- "Appointment" of CS/compliance officer for a small-cap = score 4-5 (not market moving)
+- "Copy of Newspaper Publication" = score 2-3 (routine compliance)
+- "General Updates" without specifics = score 3-4
+- ONLY award 8+ to NSE filings that involve: order wins of significant value, earnings results, buyback announcements, management changes at large-caps
 
-Return ONLY raw JSON array. Objects: title, source, url, market_impact_score (integer 1-10), reason (must name stocks and catalyst).
+GENERAL RULES:
+- Name the SPECIFIC COMPANY/TOCK and CATALYST in your "reason"
+- PREFER: order wins, earnings results, regulatory actions, buyback, insider transactions
+- PENALIZE: general market outlook, "stocks to buy/sell", personal finance, IPO status
+- DIVERSIFY: don't pick all NSE filings. Mix in news from Economic Times, Hindu BusinessLine, Moneycontrol, Google News, Business Standard
+- If two articles cover the SAME event, keep only the one with the higher score
+
+Return ONLY raw JSON array. Objects: title, source, url, market_impact_score (integer 1-10), reason (name stocks and catalyst).
 
 Articles:{articles_json}
 """
@@ -984,7 +991,25 @@ def analyze_articles(articles: List[Dict], config: dict) -> List[Dict]:
     ranked = [a for a in ranked if a.get("market_impact_score", 0) >= min_score]
     ranked.sort(key=lambda x: x.get("market_impact_score", 0), reverse=True)
     log.info(f"LLM ranked {len(ranked)} articles (min score {min_score}+)")
+
+    # Apply source diversity: max 4 NSE filings in final output
+    ranked = _diversify_sources(ranked, max_nse=4)
     return ranked[:top_n]
+
+
+def _diversify_sources(articles: List[Dict], max_nse: int = 4) -> List[Dict]:
+    """Ensure source diversity — cap NSE filings to prevent over-representation."""
+    nse_count = 0
+    diverse = []
+    for a in articles:
+        source = (a.get("source") or "").lower()
+        if "nse" in source or "filing" in source:
+            if nse_count >= max_nse:
+                continue
+            nse_count += 1
+        diverse.append(a)
+    log.info(f"Diversity filter: {len(articles)} -> {len(diverse)} ({nse_count} NSE capped)")
+    return diverse
 
 
 def _parse_llm_response(response: str) -> List[Dict]:

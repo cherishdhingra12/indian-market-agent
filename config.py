@@ -17,7 +17,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 # ─── Agent Behaviour ──────────────────────────────────────────────────────────
-TOP_NEWS_COUNT = 7
+TOP_NEWS_COUNT = 13
 MIN_IMPACT_SCORE = 5
 REQUEST_DELAY = 1.0
 
