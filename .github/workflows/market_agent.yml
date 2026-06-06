@@ -1,0 +1,39 @@
+name: Indian Market News Agent
+
+on:
+  schedule:
+    # 9:00 AM IST = 3:30 AM UTC
+    - cron: '30 3 * * *'
+    # 2:00 PM IST = 8:30 AM UTC
+    - cron: '30 8 * * *'
+    # 7:00 PM IST = 1:30 PM UTC
+    - cron: '30 13 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Market News Agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LLM_PROVIDER: gemini
+          LLM_MODEL: gemini-2.0-flash
+        run: python indian_market_agent.py
