@@ -23,6 +23,7 @@ REQUEST_DELAY = 1.0
 
 # ─── News Sources ─────────────────────────────────────────────────────────────
 NEWS_SOURCES = {
+    "nse_announcements": True,
     "moneycontrol": True,
     "economictimes": True,
     "business_standard": True,

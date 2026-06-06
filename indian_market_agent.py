@@ -441,6 +441,86 @@ def scrape_zeebiz() -> List[Dict]:
 
 
 # ──────────────────────────────────────────────────────────────────────
+#  High-Value Source: NSE Corporate Announcements (Early Signals)
+# ──────────────────────────────────────────────────────────────────────
+
+# Categories that indicate direct stock-moving potential
+HIGH_VALUE_CATS = {
+    "Outcome of Board Meeting",       # dividends, buybacks, earnings
+    "Awarding of order(s)/contract(s)",  # order wins
+    "Bagging/Receiving of orders/contracts",  # order wins
+    "Appointment",                     # CEO/CFO/Key management changes
+    "Analysts/Institutional Investor Meet/Con. Call Updates",  # institutional interest
+    "Updates",                         # general updates (may contain price-sensitive info)
+    "General Updates",
+    "Corrigendum",                     # corrections to previous announcements
+}
+
+
+def scrape_nse_announcements() -> List[Dict]:
+    """
+    Scrape NSE Corporate Announcements — real-time exchange filings.
+    These are filed directly by companies and contain early-stage
+    price-sensitive information (order wins, board outcomes, etc.).
+    """
+    articles = []
+    try:
+        session = _get_session()
+        session.get("https://www.nseindia.com", timeout=10)
+        time.sleep(0.5)
+        resp = session.get(
+            "https://www.nseindia.com/api/corporate-announcements?index=equities",
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            log.warning(f"NSE announcements: unexpected response format")
+            return articles
+
+        for item in data:
+            cat = (item.get("desc") or "").strip()
+            symbol = (item.get("symbol") or "").strip()
+            company = (item.get("sm_name") or "").strip()
+            text = (item.get("attchmntText") or "").strip()
+            pdf = (item.get("attchmntFile") or "").strip()
+            timestamp = (item.get("an_dt") or "").strip()
+
+            if not text and not cat:
+                continue
+
+            title = f"{symbol}: {cat}" if symbol and cat else text[:120]
+            snippet = f"{company} | {text}" if company and text else text
+            articles.append({
+                "title": title,
+                "url": pdf if pdf else f"https://www.nseindia.com/get-quotes/equity?symbol={symbol}",
+                "source": "NSE Filing",
+                "snippet": snippet[:300],
+                "symbol": symbol,
+                "category": cat,
+                "company": company,
+                "timestamp": timestamp,
+            })
+
+        log.info(f"NSE Corporate Announcements: {len(articles)} items")
+    except Exception as e:
+        log.error(f"NSE announcements scrape failed: {e}")
+
+    return articles
+
+
+def scrape_nse_high_value() -> List[Dict]:
+    """
+    Scrape NSE announcements and filter for only high-value categories
+    that are most likely to move stock prices.
+    """
+    all_items = scrape_nse_announcements()
+    filtered = [a for a in all_items if a.get("category") in HIGH_VALUE_CATS]
+    log.info(f"NSE high-value announcements: {len(filtered)} (filtered from {len(all_items)})")
+    return filtered
+
+
+# ──────────────────────────────────────────────────────────────────────
 #  Google News RSS — Reliable primary source
 # ──────────────────────────────────────────────────────────────────────
 
@@ -604,6 +684,98 @@ def _infer_source(url: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────
+#  Semantic Deduplication
+# ──────────────────────────────────────────────────────────────────────
+
+def _normalize(text: str) -> str:
+    """Normalize text for similarity comparison."""
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    # Remove common stopwords
+    stopwords = {'the', 'a', 'an', 'in', 'of', 'to', 'for', 'on', 'and', 'is',
+                 'at', 'by', 'with', 'from', 'as', 'its', 'it', 'be', 'has',
+                 'are', 'was', 'were', 'been', 'will', 'may', 'would', 'could',
+                 'should', 'this', 'that', 'these', 'those', 'after', 'before',
+                 'during', 'over', 'into', 'through', 'up', 'down', 'out',
+                 'about', 'than', 'also', 'very', 'just', 'all', 'each',
+                 'their', 'his', 'her', 'our', 'your', 'my', 'no', 'not',
+                 'but', 'or', 'if', 'so', 'than', 'too', 'very', 'can', 'do'}
+    words = [w for w in text.split() if w not in stopwords and len(w) > 2]
+    return ' '.join(words)
+
+
+def _similarity(a: str, b: str) -> float:
+    """Jaccard similarity of two normalized strings."""
+    words_a = set(_normalize(a).split())
+    words_b = set(_normalize(b).split())
+    if not words_a or not words_b:
+        return 0.0
+    intersection = words_a & words_b
+    union = words_a | words_b
+    return len(intersection) / len(union)
+
+
+# Source authority ranking (higher = more credible)
+SOURCE_PRIORITY = {
+    "NSE Filing": 10,
+    "Moneycontrol": 5,
+    "Economic Times": 5,
+    "Business Standard": 5,
+    "Hindu BusinessLine": 5,
+    "Livemint": 4,
+    "Google News": 3,
+    "NDTV Profit": 4,
+    "Financial Express": 4,
+    "Web Search": 2,
+    "Zee Business": 3,
+}
+
+
+def _deduplicate_semantic(articles: List[Dict], threshold: float = 0.45) -> List[Dict]:
+    """
+    Deduplicate articles by semantic similarity of their titles.
+    When two articles are similar, keep the one with higher source priority
+    or higher information content.
+    """
+    if not articles:
+        return []
+
+    scored = []
+    for a in articles:
+        title = a.get("title", "")
+        source = a.get("source", "")
+        snippet = a.get("snippet", "")
+        # Calculate info content score (longer title + snippet = more info)
+        info_score = len(title) + len(snippet) * 0.3
+        source_score = SOURCE_PRIORITY.get(source, 3)
+        a["_score"] = source_score * 2 + info_score * 0.01
+        scored.append(a)
+
+    # Sort by score descending (best quality first)
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+
+    kept = []
+    for article in scored:
+        is_dup = False
+        norm_title = _normalize(article.get("title", ""))
+        for existing in kept:
+            norm_existing = _normalize(existing.get("title", ""))
+            if _similarity(norm_title, norm_existing) > threshold:
+                is_dup = True
+                break
+        if not is_dup:
+            # Clean up internal score field
+            del article["_score"]
+            kept.append(article)
+            # Check if we have enough unique articles
+            if len(kept) >= 100:
+                break
+
+    log.info(f"Semantic dedup: {len(articles)} -> {len(kept)} unique articles")
+    return kept
+
+
+# ──────────────────────────────────────────────────────────────────────
 #  LLM News Analyzer
 # ──────────────────────────────────────────────────────────────────────
 
@@ -740,23 +912,26 @@ def _call_gemini(messages: List[Dict], config: dict) -> Optional[str]:
         return None
 
 
-ANALYSIS_PROMPT = """You are an expert Indian stock market analyst with 20 years of experience tracking NSE and BSE.
+ANALYSIS_PROMPT = """You are an expert Indian stock market analyst tracking NSE/BSE.
 
-Your task: Given the following list of news articles collected from Indian financial sources, identify the TOP {top_n} articles that would SUBSTANTIALLY affect the movement of the Indian stock market (NSE/BSE) TODAY or TOMORROW.
+Your ONLY task: Select news that will DEFINITELY move a specific stock(s) or index TODAY or TOMORROW.
 
-Evaluation criteria (score 1-10 for each article):
-- 9-10: Direct impact on market indices (RBI policy, budget, geopolitical events, major corporate earnings of index heavyweights)
-- 7-8: Strong sector-level impact (major deals, regulatory changes, key economic data like GDP/IIP/CPI)
-- 5-6: Moderate impact (company-specific news with large market cap, sector trends)
-- 3-4: Low impact (routine announcements, minor corporate news)
-- 1-2: Negligible impact (general business news, personal finance tips)
+RATING SCALE (market_impact_score 1-10):
+- 10: Certain large-cap stock mover. Major catalyst for Nifty 50/BSE 100 company: earnings surprise, order win, regulatory approval/revocation, buyback, acquisition, management change
+- 8-9: Strong conviction. Sector-wide catalyst (RBI policy, budget), or mid-cap company with major order/regulatory event, or insider/bulk/block deal
+- 6-7: Moderate. Small-cap specific catalyst (order win, board outcome), or macro data release (GDP, CPI, IIP), or FII/DII flow data
+- 4-5: Low conviction. General market commentary, analyst views without specific catalyst
+- 1-3: Noise. Exclude these.
 
-Return ONLY a valid JSON array. NO markdown, NO code blocks, NO backticks, NO explanations — just raw JSON starting with '[' and ending with ']'. Objects must have these EXACT fields:
-- "title": the article headline
-- "source": the source name
-- "url": the article URL
-- "market_impact_score": integer from 1 to 10
-- "reason": one sentence explaining the market impact specifically in Indian market context
+CRITICAL RULES:
+- Name the SPECIFIC COMPANY/STOCK and the CATALYST in your "reason" field
+- NSE Filing = direct exchange filing = credible. But a routine filing for a small-cap (Rhetan, Chemfab) is less impactful than the same filing for a Nifty 50 company (Reliance, TCS, HDFC)
+- PREFER: order wins, earnings results, regulatory actions, buyback announcements, insider transactions
+- PENALIZE: general market outlook, top stocks to buy/sell, personal finance, IPO subscription status
+- PENALIZE: duplicate/overlapping stories about the same event
+- If the article title is generic (like "Share Market Today") but the snippet mentions specific stocks, rate based on the stocks mentioned
+
+Return ONLY raw JSON array. Objects: title, source, url, market_impact_score (integer 1-10), reason (must name stocks and catalyst).
 
 Articles:{articles_json}
 """
@@ -787,7 +962,6 @@ def analyze_articles(articles: List[Dict], config: dict) -> List[Dict]:
     ]
 
     prompt = ANALYSIS_PROMPT.format(
-        top_n=top_n,
         articles_json=json.dumps(articles_for_prompt, ensure_ascii=False, indent=2),
     )
 
@@ -845,52 +1019,107 @@ def _parse_llm_response(response: str) -> List[Dict]:
 
 def _keyword_score(articles: List[Dict], top_n: int = 10) -> List[Dict]:
     """Fallback scoring using keywords if LLM unavailable."""
-    HIGH_IMPACT_KEYWORDS = [
-        "rbi", "repo rate", "monetary policy", "budget", "fiscal deficit",
-        "gdp", "inflation", "cpi", "iip", "manufacturing pmi", "services pmi",
-        "geopolitical", "war", "sanction", "crude oil", "gst council",
-        "sebi", "fdi", "fpi", "fii", "dii", "foreign institutional",
-        "excise duty", "income tax", "corporate tax",
-        "ipo", "listing", "results", "quarterly earnings",
-        "merger", "acquisition", "takeover", "buyback", "dividend",
-        "rating", "credit rating", "moody", "s&p", "fitch",
-        "banking", "hdfc", "icici", "sbi", "reliance", "tata", "infosys",
-        "nifty", "sensex", "bse", "nse", "benchmark", "index",
-        "block deal", "bulk deal", "anchor", "ipo listing",
-        "trade war", "tariff", "export", "import", "current account",
-        "forex", "rupee", "dollar", "fed rate", "us fed",
-        "adani", "ambani", "tata group",
+
+    # Nifty 50 companies (any mention = potential stock mover)
+    NIFTY50 = [
+        "reliance", "tcs", "hdfc bank", "infosys", "hul", "icici bank",
+        "hdfc", "itc", "sbi", "bharti airtel", "kotak mahindra", "l&t",
+        "wipro", "axis bank", "bajaj finance", "asian paints", "maruti",
+        "sun pharma", "tata motors", "ntpc", "m&m", "titan", "jsw steel",
+        "powergrid", "nestle", "tech mahindra", "hcl tech", "bajaj finserv",
+        "ultratech cement", "sbi life", "tata steel", "grasim", "cipla",
+        "dabur", "hindalco", "ongc", "adani ports", "dr reddy", "eicher",
+        "indusind bank", "bajaj auto", "divi lab", "britannia", "coal india",
+        "bpcl", "shriram finance", "adani enterprises", "herouno moto",
+        "hdfc life", "apollo hospitals", "adani green", "adani transmission",
+        "wipro", "icici pruden", "sbi card", "dmart", "tata consumer",
+        "havells", "torrent pharma", "marico", "berger paints",
+    ]
+
+    CATALYST_KEYWORDS = [
+        # Order wins & business
+        "order win", "order worth", "contract", "bag order", "award order",
+        "new order", "export order", "secures order", "gets order",
+        # Regulatory & govt
+        "sebi order", "sebi notice", "sebi ban", "sebi fine",
+        "income tax raid", "ed raid", "ed summons", "investigation",
+        "show cause", "penalty", "regulatory approval", "government approval",
+        "dpiit", "nclt", "bankruptcy", "resolution plan",
+        # Earnings & corporate actions
+        "quarterly results", "q1 results", "q2 results", "q3 results", "q4 results",
+        "profit rises", "profit falls", "revenue growth", "net profit",
+        "ebitda", "margin expansion", "earnings beat", "earnings miss",
+        "buyback", "dividend declared", "stock split", "bonus issue",
+        "rights issue", "delisting", "corporate action",
+        # M&A
+        "acquisition", "merger", "demerger", "stake sale", "stake buy",
+        "promoter sells", "promoter buys", "bulk deal", "block deal",
+        "fii buy", "dii buy", "anchor investor",
+        # Management
+        "ceo resign", "cfo resign", "appointment", "management change",
+        "board meeting", "board approves",
+        # Market moving
+        "rbi policy", "repo rate", "crr", "slr", "monetary policy",
+        "union budget", "fiscal deficit", "gst council",
+        "ipo listing", "listing gain", "listing loss",
+        "iip data", "cpi inflation", "gdp data", "pmi data",
+        "fpi outflow", "fii outflow", "dii inflow",
+        "crude oil price", "rupee fall", "rupee rise", "dollar index",
+        "fed rate", "us fed",
+        # Price sensitive
+        "upper circuit", "lower circuit", "52-week high", "52-week low",
+        "price target", "upgrade", "downgrade", "buy rating", "overweight",
     ]
 
     scored = []
     for article in articles:
         text = f"{article['title']} {article.get('snippet', '')}".lower()
+        source = article.get("source", "").lower()
+
         score = 1
-        for kw in HIGH_IMPACT_KEYWORDS:
-            if kw.lower() in text:
+        matched_keywords = []
+
+        # Check for Nifty 50 company names (high weight)
+        for company in NIFTY50:
+            if company in text:
+                score += 2
+                matched_keywords.append(company)
+
+        # Check for catalyst keywords
+        for kw in CATALYST_KEYWORDS:
+            if kw in text:
                 score += 1
-        score = min(score, 8)
+                matched_keywords.append(kw)
+
+        # Source bonus: NSE filings are most authentic
+        if "nse filing" in source:
+            score += 2
+        elif source == "google news":
+            score += 0  # neutral
+
+        # Cap and store
+        score = min(score, 10)
         scored.append({
             "title": article["title"],
             "source": article["source"],
             "url": article.get("url", ""),
             "market_impact_score": score,
-            "reason": _keyword_reason(text, score),
+            "reason": _keyword_reason(text, score, matched_keywords),
         })
 
     scored.sort(key=lambda x: x["market_impact_score"], reverse=True)
     return scored[:top_n]
 
 
-def _keyword_reason(text: str, score: int) -> str:
-    if score >= 7:
-        return "Contains multiple high-impact financial keywords — likely to move the market."
-    elif score >= 5:
-        return "Contains significant financial/economic terms — moderate market impact expected."
-    elif score >= 3:
-        return "Contains some relevant financial terms — potential sector-level impact."
+def _keyword_reason(text: str, score: int, matched_kws: list = None) -> str:
+    if score >= 8:
+        return "Direct stock-specific catalyst detected — high probability of market movement."
+    elif score >= 6:
+        return "Significant financial/regulatory trigger identified — moderate-to-high impact expected."
+    elif score >= 4:
+        return "Relevant market news with potential sector-level impact."
     else:
-        return "General financial news — limited direct market impact."
+        return "General finance news — limited direct stock impact."
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -996,11 +1225,19 @@ def _split_message(text: str, max_length: int = 3800) -> List[str]:
 # ──────────────────────────────────────────────────────────────────────
 
 def collect_news(config: dict) -> List[Dict]:
-    """Collect news from all enabled sources (RSS + HTML + Web Search)."""
+    """Collect news from all sources, prioritizing early-signal data."""
     all_articles = []
     sources_enabled = config.get("news_sources", {})
 
-    # Tier 1: Google News RSS (most reliable, broad coverage)
+    # Tier 0: NSE Corporate Announcements (earliest signals — exchange filings)
+    try:
+        nse_articles = scrape_nse_high_value()
+        all_articles.extend(nse_articles)
+        time.sleep(config.get("request_delay", 1.0))
+    except Exception as e:
+        log.error(f"NSE announcements failed: {e}")
+
+    # Tier 1: Google News RSS (broad coverage)
     try:
         google_articles = search_google_news_multi()
         all_articles.extend(google_articles)
@@ -1036,18 +1273,23 @@ def collect_news(config: dict) -> List[Dict]:
     except Exception as e:
         log.error(f"Web search enrichment failed: {e}")
 
-    # Deduplicate by URL (normalized)
+    # Deduplicate by URL (exact)
     seen_urls = set()
-    unique = []
+    url_deduped = []
     for a in all_articles:
         url = a.get("url", "").rstrip("/")
         norm = url.lower().split("?")[0].split("#")[0]
         if norm and norm not in seen_urls and len(a.get("title", "")) > 10:
             seen_urls.add(norm)
-            unique.append(a)
+            url_deduped.append(a)
 
-    log.info(f"Total unique articles collected: {len(unique)}")
-    return unique
+    log.info(f"After URL dedup: {len(url_deduped)} articles")
+
+    # Deduplicate by semantic similarity (catch same story from different sources)
+    deduped = _deduplicate_semantic(url_deduped, threshold=0.40)
+
+    log.info(f"After semantic dedup: {len(deduped)} unique articles")
+    return deduped
 
 
 def get_time_label(config: dict) -> str:
