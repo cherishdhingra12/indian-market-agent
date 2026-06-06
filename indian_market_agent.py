@@ -914,31 +914,28 @@ def _call_gemini(messages: List[Dict], config: dict) -> Optional[str]:
 
 ANALYSIS_PROMPT = """You are an expert Indian stock market analyst tracking NSE/BSE.
 
-Your ONLY task: Select news that will DEFINITELY move a specific stock(s) or index TODAY or TOMORROW.
+Your ONLY task: Select news that will DEFINITELY move Indian stocks or indices TODAY or TOMORROW.
+
+Every article must have a "type" field:
+- "stock": Company-specific catalyst that will move a PARTICULAR STOCK (earnings, order win, management change, regulatory action on company, buyback, insider/bulk deal)
+- "index": Broad market news that will move INDICES/SECTORS (RBI policy, budget, GDP/inflation data, crude oil, FII flows, geopolitical, Fed rate, sector-wide news)
+- If it names a specific company WITH a catalyst → "stock"
+- If it's about the market/economy/sector without naming a specific company catalyst → "index"
 
 RATING SCALE (market_impact_score 1-10):
-- 10: Certain large-cap mover. Major catalyst for Nifty 50/BSE 100 company: earnings surprise, blockbuster order win, regulatory approval/revocation, buyback, acquisition
-- 8-9: Strong. Sector-wide catalyst (RBI policy, budget, GST), mid-cap with major order/regulatory event, insider/bulk/block deal
-- 6-7: Moderate. Small-cap specific catalyst (order win, board outcome), macro data (GDP, CPI), FII/DII data
-- 4-5: Low conviction. Market commentary, analyst views without specific catalyst
+- 10: Certain large-cap mover. Nifty 50 company: earnings surprise, blockbuster order win, buyback
+- 8-9: Strong. RBI/budget/GST policy, mid-cap major order/regulatory, bulk/block deal
+- 6-7: Moderate. Small-cap catalyst (order win), macro data (GDP/CPI), FII data
+- 4-5: Low conviction. Market commentary without catalyst
 - 1-3: Noise. Exclude.
 
-CRITICAL RULES FOR NSE FILINGS:
-- A routine filing for a small-cap stock (e.g., Rhetan, Chemfab, GLFL) = MAX score 6, unless the news is truly exceptional (major order, regulatory approval)
-- A filing for a Nifty 50 company (Reliance, TCS, HDFC, Infosys, etc.) = score normally based on catalyst
-- "Appointment" of CS/compliance officer for a small-cap = score 4-5 (not market moving)
-- "Copy of Newspaper Publication" = score 2-3 (routine compliance)
-- "General Updates" without specifics = score 3-4
-- ONLY award 8+ to NSE filings that involve: order wins of significant value, earnings results, buyback announcements, management changes at large-caps
+NSE FILING RULES:
+- Small-cap routine filing (Appointment of CS, Newspaper Publication) = max 5, type "stock"
+- Small-cap order win/board outcome = score 6-7, type "stock"
+- Any Nifty 50 company filing = score normally, type "stock"
 
-GENERAL RULES:
-- Name the SPECIFIC COMPANY/TOCK and CATALYST in your "reason"
-- PREFER: order wins, earnings results, regulatory actions, buyback, insider transactions
-- PENALIZE: general market outlook, "stocks to buy/sell", personal finance, IPO status
-- DIVERSIFY: don't pick all NSE filings. Mix in news from Economic Times, Hindu BusinessLine, Moneycontrol, Google News, Business Standard
-- If two articles cover the SAME event, keep only the one with the higher score
-
-Return ONLY raw JSON array. Objects: title, source, url, market_impact_score (integer 1-10), reason (name stocks and catalyst).
+Return ONLY raw JSON array. Objects: title, source, url, market_impact_score (integer 1-10), type ("stock" or "index"), reason (name stocks/catalyst).
+Aim for about 60% "stock" and 40% "index" type articles in your selection.
 
 Articles:{articles_json}
 """
@@ -992,23 +989,34 @@ def analyze_articles(articles: List[Dict], config: dict) -> List[Dict]:
     ranked.sort(key=lambda x: x.get("market_impact_score", 0), reverse=True)
     log.info(f"LLM ranked {len(ranked)} articles (min score {min_score}+)")
 
-    # Apply source diversity: max 4 NSE filings in final output
-    ranked = _diversify_sources(ranked, max_nse=4)
+    # Apply source diversity: 50-50 split NSE/Media for stock-type articles
+    ranked = _diversify_sources(ranked, max_nse=6)
     return ranked[:top_n]
 
 
-def _diversify_sources(articles: List[Dict], max_nse: int = 4) -> List[Dict]:
-    """Ensure source diversity — cap NSE filings to prevent over-representation."""
+def _diversify_sources(articles: List[Dict], max_nse: int = 6) -> List[Dict]:
+    """Ensure source diversity — 50-50 split between NSE filings and media."""
     nse_count = 0
+    media_needed = max_nse  # aim for equal media representation
+    media_count = 0
     diverse = []
     for a in articles:
         source = (a.get("source") or "").lower()
-        if "nse" in source or "filing" in source:
-            if nse_count >= max_nse:
-                continue
-            nse_count += 1
-        diverse.append(a)
-    log.info(f"Diversity filter: {len(articles)} -> {len(diverse)} ({nse_count} NSE capped)")
+        is_nse = "nse" in source or "filing" in source
+        a_type = a.get("type", "stock")
+
+        if a_type == "index":
+            # Index movers: always include (no cap)
+            diverse.append(a)
+        elif is_nse:
+            if nse_count < max_nse:
+                nse_count += 1
+                diverse.append(a)
+        else:
+            if media_count < max_nse + 3:  # allow slightly more media
+                media_count += 1
+                diverse.append(a)
+    log.info(f"Diversity filter: {len(articles)} -> {len(diverse)} ({nse_count} NSE, {media_count} media)")
     return diverse
 
 
@@ -1189,7 +1197,7 @@ def send_telegram(articles: List[Dict], time_label: str, config: dict) -> bool:
 
 
 def _format_message(articles: List[Dict], time_label: str, config: dict) -> str:
-    """Format articles into a readable HTML message (no emojis as per user preference)."""
+    """Format articles into a readable HTML message with two sections."""
     if not articles:
         return ""
 
@@ -1199,22 +1207,51 @@ def _format_message(articles: List[Dict], time_label: str, config: dict) -> str:
     lines.append("=" * 40)
     lines.append("")
 
-    for i, article in enumerate(articles, 1):
-        title = article.get("title", "Untitled")
-        source = article.get("source", "Unknown")
-        url = article.get("url", "")
-        score = article.get("market_impact_score", "?")
-        reason = article.get("reason", "")
+    # Split into stock-specific and index-movers
+    stock_items = [a for a in articles if a.get("type") == "stock"]
+    index_items = [a for a in articles if a.get("type") != "stock"]
 
-        bars = "|" * (min(score, 10) if isinstance(score, int) else 0)
-        lines.append(f"<b>{i}. {title}</b>")
-        lines.append(f"   Source: {source}")
-        if url:
-            lines.append(f"   <a href='{url}'>Read full article</a>")
-        lines.append(f"   Impact: {bars} ({score}/10)")
-        if reason:
-            lines.append(f"   Why: {reason}")
+    # Stock-specific section
+    if stock_items:
+        lines.append("<b>--- STOCK-SPECIFIC CATALYSTS ---</b>")
         lines.append("")
+        for i, article in enumerate(stock_items, 1):
+            title = article.get("title", "Untitled")
+            source = article.get("source", "Unknown")
+            url = article.get("url", "")
+            score = article.get("market_impact_score", "?")
+            reason = article.get("reason", "")
+
+            bars = "|" * (min(score, 10) if isinstance(score, int) else 0)
+            lines.append(f"<b>{i}. {title}</b>")
+            lines.append(f"   Source: {source}")
+            if url:
+                lines.append(f"   <a href='{url}'>Read full article</a>")
+            lines.append(f"   Impact: {bars} ({score}/10)")
+            if reason:
+                lines.append(f"   Why: {reason}")
+            lines.append("")
+
+    # Index movers section
+    if index_items:
+        lines.append("<b>--- INDEX MOVERS & BREAKING NEWS ---</b>")
+        lines.append("")
+        for i, article in enumerate(index_items, len(stock_items) + 1):
+            title = article.get("title", "Untitled")
+            source = article.get("source", "Unknown")
+            url = article.get("url", "")
+            score = article.get("market_impact_score", "?")
+            reason = article.get("reason", "")
+
+            bars = "|" * (min(score, 10) if isinstance(score, int) else 0)
+            lines.append(f"<b>{i}. {title}</b>")
+            lines.append(f"   Source: {source}")
+            if url:
+                lines.append(f"   <a href='{url}'>Read full article</a>")
+            lines.append(f"   Impact: {bars} ({score}/10)")
+            if reason:
+                lines.append(f"   Why: {reason}")
+            lines.append("")
 
     lines.append("=" * 40)
     lines.append("Market Intel Agent | Next update in ~5-7 hours")
@@ -1311,7 +1348,7 @@ def collect_news(config: dict) -> List[Dict]:
     log.info(f"After URL dedup: {len(url_deduped)} articles")
 
     # Deduplicate by semantic similarity (catch same story from different sources)
-    deduped = _deduplicate_semantic(url_deduped, threshold=0.40)
+    deduped = _deduplicate_semantic(url_deduped, threshold=0.28)
 
     log.info(f"After semantic dedup: {len(deduped)} unique articles")
     return deduped
