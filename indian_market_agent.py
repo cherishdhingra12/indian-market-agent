@@ -699,17 +699,20 @@ def _call_gemini(messages: List[Dict], config: dict) -> Optional[str]:
         url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={api_key}"
 
         # Convert OpenAI-style messages to Gemini format
-        system_instruction = None
+        # Gemini doesn't support systemInstruction on all models,
+        # so we prepend system messages to the first user message
+        system_text = ""
         contents = []
         for m in messages:
             role = m["role"]
             text = m["content"]
             if role == "system":
-                system_instruction = {"parts": [{"text": text}]}
+                system_text = text + "\n\n"
             elif role == "assistant":
                 contents.append({"role": "model", "parts": [{"text": text}]})
             else:
-                contents.append({"role": "user", "parts": [{"text": text}]})
+                contents.append({"role": "user", "parts": [{"text": system_text + text}]})
+                system_text = ""
 
         body = {
             "contents": contents,
@@ -718,8 +721,6 @@ def _call_gemini(messages: List[Dict], config: dict) -> Optional[str]:
                 "maxOutputTokens": config.get("llm_max_tokens", 2000),
             },
         }
-        if system_instruction:
-            body["systemInstruction"] = system_instruction
 
         resp = requests.post(url, json=body, timeout=90)
         resp.raise_for_status()
