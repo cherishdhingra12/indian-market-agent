@@ -248,7 +248,7 @@ All changes committed and pushed to `origin/main`.
 - **User requested:** A file containing every detail about the project for future AI recall
 - **Result:** This file (`PROJECT_MEMORY.md`) — comprehensive project memory
 
-### Session 3: Pre-Flight Check for 9AM Go-Live (Jun 8, 00:XX IST)
+### Session 3: Pre-Flight Check for 9AM Go-Live (Jun 8, 00:16 IST)
 - **User requested:** Deep analysis before 9AM IST trigger
 - **Bugs found & fixed:**
   1. **Gemini auth broken** — `_call_gemini()` used `?key=` query param but API requires `x-goog-api-key` header. All Gemini calls silently returned 403 and fell back to keyword scoring. **Verified fixed with live API test.**
@@ -262,7 +262,13 @@ All changes committed and pushed to `origin/main`.
   - ⚠️ **Telegram:** 1/3 messages sent before local timeout (300s); chunking worked correctly
   - ✅ **Time label:** "9:00 AM (Pre-Market)" — correct IST via UTC+5:30
 - **Actions workflow simulation:** Config loads correctly with env vars, all 13 sources enabled, TOP_NEWS_COUNT=15, MIN_IMPACT_SCORE=6
-- **Committed & pushed** as `64bc22e`
+- **Final smoke test (Jun 8, 00:31 IST):**
+  - ✅ Gemini API responded correctly (header auth working)
+  - ✅ JSON parsing parsed valid response
+  - ✅ Telegram delivered test message
+  - ✅ IST time label shows correct "9:00 AM (Pre-Market)"
+- **GitHub verification:** Secrets confirmed present, Actions enabled, remote branch up to date
+- **Committed & pushed** as `64bc22e`, `33b2a17`
 
 ### Key Decisions Made
 1. **Gemini 2.5 Flash Lite** chosen as LLM — free tier, 60 req/min, 1500 req/day
