@@ -929,7 +929,7 @@ def _call_gemini(messages: List[Dict], config: dict) -> Optional[str]:
     try:
         api_key = config["llm_api_key"]
         model = config.get("llm_model", "gemini-2.0-flash")
-        url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent"
 
         # Convert OpenAI-style messages to Gemini format
         # Gemini doesn't support systemInstruction on all models,
@@ -955,7 +955,7 @@ def _call_gemini(messages: List[Dict], config: dict) -> Optional[str]:
             },
         }
 
-        resp = requests.post(url, json=body, timeout=90)
+        resp = requests.post(url, json=body, headers={"x-goog-api-key": api_key}, timeout=90)
         resp.raise_for_status()
         data = resp.json()
 
@@ -1009,10 +1009,14 @@ def analyze_articles(articles: List[Dict], config: dict) -> List[Dict]:
         return []
 
     top_n = config.get("top_news_count", 7)
+    min_score = config.get("min_impact_score", 5)
+
+    def _filter_by_min_score(articles_list):
+        return [a for a in articles_list if a.get("market_impact_score", 0) >= min_score]
 
     if config.get("llm_provider") == "none" or not config.get("llm_api_key") or "YOUR_" in config.get("llm_api_key", ""):
         log.info("LLM not configured — using keyword-based fallback scoring")
-        return _keyword_score(articles, top_n)
+        return _filter_by_min_score(_keyword_score(articles, top_n))
 
     # Two-pass approach: keyword pre-filter → LLM final ranking
     # Pass 1: Score all articles with keywords, keep top candidates
@@ -1038,14 +1042,13 @@ def analyze_articles(articles: List[Dict], config: dict) -> List[Dict]:
     response = call_llm(messages, config)
     if not response:
         log.warning("LLM returned empty response — using keyword fallback")
-        return _keyword_score(articles, top_n)
+        return _filter_by_min_score(_keyword_score(articles, top_n))
 
     ranked = _parse_llm_response(response)
     if not ranked:
         log.warning("Could not parse LLM response — using keyword fallback")
-        return _keyword_score(articles, top_n)
+        return _filter_by_min_score(_keyword_score(articles, top_n))
 
-    min_score = config.get("min_impact_score", 5)
     ranked = [a for a in ranked if a.get("market_impact_score", 0) >= min_score]
     ranked.sort(key=lambda x: x.get("market_impact_score", 0), reverse=True)
     log.info(f"LLM ranked {len(ranked)} articles (min score {min_score}+)")
