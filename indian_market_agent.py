@@ -21,7 +21,7 @@ import time
 import logging
 import re
 import xml.etree.ElementTree as ET
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urljoin, urlparse, parse_qs
 from html import unescape
@@ -369,8 +369,8 @@ def scrape_livemint() -> List[Dict]:
 
 
 def scrape_ndtv_profit() -> List[Dict]:
-    """Scrape NDTV Profit via RSS + HTML."""
-    articles = _parse_rss("https://www.ndtvprofit.com/rss/latest", "NDTV Profit")
+    """Scrape NDTV Profit via Feedburner RSS + HTML."""
+    articles = _parse_rss("https://feeds.feedburner.com/ndtvprofit-latest", "NDTV Profit")
     if len(articles) >= 10:
         return articles
 
@@ -400,14 +400,11 @@ def scrape_ndtv_profit() -> List[Dict]:
 
 
 def scrape_financial_express() -> List[Dict]:
-    """Scrape Financial Express via RSS + HTML."""
-    articles = _parse_rss("https://www.financialexpress.com/feed/", "Financial Express")
-    if len(articles) >= 10:
-        return articles
-
+    """Scrape Financial Express via HTML (RSS feeds disabled by site)."""
     soup = _fetch_soup("https://www.financialexpress.com/market/")
     if not soup:
-        return articles
+        return []
+    articles = []
 
     for item in soup.select("article, .story-card, .listing-item, .card-item, li"):
         title_el = item.select_one("h2 a, h3 a, .entry-title a, a[rel='bookmark'], a[class*='title']")
@@ -436,8 +433,55 @@ def scrape_the_hindu_businessline() -> List[Dict]:
 
 
 def scrape_zeebiz() -> List[Dict]:
-    """Scrape Zee Business via RSS."""
-    return _parse_rss("https://www.zeebiz.com/rss/market.xml", "Zee Business")
+    """Scrape Zee Business via HTML (RSS behind Akamai CDN)."""
+    articles = _parse_rss("https://www.zeebiz.com/rss.xml", "Zee Business")
+    if articles:
+        return articles
+
+    soup = _fetch_soup("https://www.zeebiz.com/markets")
+    if not soup:
+        return articles
+
+    for item in soup.select("article, .story-card, .card, li.story-item, .news-card"):
+        title_el = item.select_one("h2 a, h3 a, .title a, a[class*='title']")
+        if not title_el:
+            continue
+        title = title_el.get_text(strip=True)
+        link = title_el.get("href", "")
+        if not title or not link:
+            continue
+        snippet_el = item.select_one("p, .desc, .summary, .excerpt")
+        snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+        articles.append({
+            "title": title,
+            "url": link if link.startswith("http") else f"https://www.zeebiz.com{link}",
+            "source": "Zee Business",
+            "snippet": snippet[:300],
+        })
+
+    log.info(f"Zee Business: {len(articles)} articles")
+    return articles
+
+
+def scrape_business_today() -> List[Dict]:
+    """Scrape Business Today via RSS."""
+    articles = _parse_rss("https://www.businesstoday.in/rssfeeds/?id=home", "Business Today")
+    return articles
+
+
+def scrape_inc42() -> List[Dict]:
+    """Scrape Inc42 startup funding news via RSS."""
+    return _parse_rss("https://inc42.com/feed/", "Inc42")
+
+
+def scrape_sebi() -> List[Dict]:
+    """Scrape SEBI regulatory news via RSS."""
+    return _parse_rss("https://www.sebi.gov.in/sebirss.xml", "SEBI")
+
+
+def scrape_investing_india() -> List[Dict]:
+    """Scrape Investing.com India financial news via RSS."""
+    return _parse_rss("https://in.investing.com/rss/news.rss", "Investing.com India")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -541,6 +585,12 @@ GOOGLE_NEWS_QUERIES = [
     "RBI+OR+SEBI+OR+Indian+economy",
     "Sensex+OR+Nifty+OR+share+market+India",
     "Indian+stock+market+breaking+news",
+    "NSE+corporate+results+OR+earnings+OR+dividend+India",
+    "IPO+OR+buyback+OR+stock+split+OR+buyback+India+market",
+    "FII+OR+DII+OR+FPI+flow+OR+foreign+investment+India",
+    "crude+oil+OR+gold+OR+commodity+price+India+market",
+    "India+IPO+OR+startup+funding+OR+venture+capital",
+    "budget+OR+GDP+OR+inflation+OR+economic+data+India",
 ]
 
 
@@ -627,9 +677,13 @@ def search_breaking_news() -> List[Dict]:
         "site:economictimes.indiatimes.com stock market",
         "site:moneycontrol.com NSE BSE news",
         "site:livemint.com market",
+        "site:businesstoday.in stock market",
+        "site:business-standard.com markets",
         "breaking news Indian stock market today",
         "Indian share market top news today",
         "RBI budget SEBI news market impact India",
+        "NSE corporate announcement board meeting outcome",
+        "FII DII trading activity India stock market",
     ]
 
     all_articles = []
@@ -664,6 +718,7 @@ def _infer_source(url: str) -> str:
         "thehindubusinessline": "Hindu BusinessLine",
         "hindubusinessline": "Hindu BusinessLine",
         "zeebiz": "Zee Business",
+        "businesstoday": "Business Today",
         "bloomberg": "Bloomberg",
         "reuters": "Reuters",
         "indiatimes": "India Times",
@@ -672,10 +727,12 @@ def _infer_source(url: str) -> str:
         "thequint": "The Quint",
         "news18": "News18",
         "cnbc": "CNBC",
-        "businesstoday": "Business Today",
         "outlookindia": "Outlook India",
         "firstpost": "Firstpost",
         "theprint": "The Print",
+        "inc42": "Inc42",
+        "sebi": "SEBI",
+        "investing": "Investing.com India",
     }
     for key, name in mapping.items():
         if key in domain:
@@ -718,16 +775,20 @@ def _similarity(a: str, b: str) -> float:
 # Source authority ranking (higher = more credible)
 SOURCE_PRIORITY = {
     "NSE Filing": 10,
+    "SEBI": 9,
     "Moneycontrol": 5,
     "Economic Times": 5,
     "Business Standard": 5,
+    "Business Today": 5,
     "Hindu BusinessLine": 5,
     "Livemint": 4,
-    "Google News": 3,
     "NDTV Profit": 4,
     "Financial Express": 4,
-    "Web Search": 2,
+    "Google News": 3,
+    "Inc42": 3,
     "Zee Business": 3,
+    "Investing.com India": 2,
+    "Web Search": 2,
 }
 
 
@@ -955,9 +1016,9 @@ def analyze_articles(articles: List[Dict], config: dict) -> List[Dict]:
 
     # Two-pass approach: keyword pre-filter → LLM final ranking
     # Pass 1: Score all articles with keywords, keep top candidates
-    pre_scored = _keyword_score(articles, 40)
+    pre_scored = _keyword_score(articles, 60)
     pre_scored.sort(key=lambda x: x.get("market_impact_score", 0), reverse=True)
-    candidates = pre_scored[:30]
+    candidates = pre_scored[:40]
 
     # Pass 2: Send only top candidates to LLM for intelligent ranking
     articles_for_prompt = [
@@ -1073,35 +1134,56 @@ def _keyword_score(articles: List[Dict], top_n: int = 10) -> List[Dict]:
         # Order wins & business
         "order win", "order worth", "contract", "bag order", "award order",
         "new order", "export order", "secures order", "gets order",
+        "letter of intent", "work order", "subscription",
         # Regulatory & govt
         "sebi order", "sebi notice", "sebi ban", "sebi fine",
         "income tax raid", "ed raid", "ed summons", "investigation",
         "show cause", "penalty", "regulatory approval", "government approval",
         "dpiit", "nclt", "bankruptcy", "resolution plan",
+        "sebi approval", "sebi clearance",
         # Earnings & corporate actions
         "quarterly results", "q1 results", "q2 results", "q3 results", "q4 results",
         "profit rises", "profit falls", "revenue growth", "net profit",
         "ebitda", "margin expansion", "earnings beat", "earnings miss",
         "buyback", "dividend declared", "stock split", "bonus issue",
         "rights issue", "delisting", "corporate action",
+        "profit after tax", "operating revenue", "net profit jumps",
         # M&A
         "acquisition", "merger", "demerger", "stake sale", "stake buy",
         "promoter sells", "promoter buys", "bulk deal", "block deal",
         "fii buy", "dii buy", "anchor investor",
+        "open offer", "takeover",
         # Management
         "ceo resign", "cfo resign", "appointment", "management change",
-        "board meeting", "board approves",
+        "board meeting", "board approves", "managing director",
+        "key managerial",
         # Market moving
         "rbi policy", "repo rate", "crr", "slr", "monetary policy",
         "union budget", "fiscal deficit", "gst council",
-        "ipo listing", "listing gain", "listing loss",
+        "ipo listing", "listing gain", "listing loss", "ipo opens", "ipo closes",
         "iip data", "cpi inflation", "gdp data", "pmi data",
         "fpi outflow", "fii outflow", "dii inflow",
         "crude oil price", "rupee fall", "rupee rise", "dollar index",
-        "fed rate", "us fed",
+        "fed rate", "us fed", "interest rate cut",
         # Price sensitive
         "upper circuit", "lower circuit", "52-week high", "52-week low",
         "price target", "upgrade", "downgrade", "buy rating", "overweight",
+        "target price", "accumulate", "add rating", "reduce rating",
+        # Sector specific
+        "gst collection", "tax revenue", "direct tax", "indirect tax",
+        "core sector", "industrial production", "manufacturing pmi",
+        "services pmi", "trade deficit", "current account",
+        # Fund flow
+        "mutual fund inflow", "sip inflow", "aum", "assets under management",
+        "nfo", "new fund offer", "index rejig", "index rebalancing",
+        "morgan stanley", "goldman sachs", "nomura", "clsa", "jpmorgan",
+        # Startup & funding
+        "funding round", "series a", "series b", "series c", "series d",
+        "seed round", "pre-ipo", "valuation",
+        "unicorn", "startup funding",
+        # NSE specific
+        "board meeting outcome", "corporate announcement",
+        "trading window", "closure of trading window",
     ]
 
     scored = []
@@ -1317,6 +1399,10 @@ def collect_news(config: dict) -> List[Dict]:
         "financial_express": scrape_financial_express,
         "the_hindu_businessline": scrape_the_hindu_businessline,
         "zeebiz": scrape_zeebiz,
+        "business_today": scrape_business_today,
+        "inc42": scrape_inc42,
+        "sebi": scrape_sebi,
+        "investing_india": scrape_investing_india,
     }
 
     for source_name, scraper_fn in scraper_map.items():
@@ -1348,15 +1434,16 @@ def collect_news(config: dict) -> List[Dict]:
     log.info(f"After URL dedup: {len(url_deduped)} articles")
 
     # Deduplicate by semantic similarity (catch same story from different sources)
-    deduped = _deduplicate_semantic(url_deduped, threshold=0.28)
+    deduped = _deduplicate_semantic(url_deduped, threshold=0.30)
 
     log.info(f"After semantic dedup: {len(deduped)} unique articles")
     return deduped
 
 
 def get_time_label(config: dict) -> str:
-    """Determine the schedule label based on current hour."""
-    hour = datetime.now().hour
+    """Determine the schedule label based on IST (UTC+5:30)."""
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    hour = ist_now.hour
     if hour < 11:
         return config.get("schedule_label", {}).get("0900", "9:00 AM")
     elif hour < 17:

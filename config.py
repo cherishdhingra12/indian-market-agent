@@ -8,7 +8,7 @@ LLM_PROVIDER = "gemini"  # "gemini", "groq", "openai", "anthropic", or "none"
 LLM_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
 LLM_MODEL = "gemini-2.5-flash-lite"
 LLM_TEMPERATURE = 0.2
-LLM_MAX_TOKENS = 4096
+LLM_MAX_TOKENS = 8192
 
 # ─── Telegram Configuration ───────────────────────────────────────────────────
 # 1. Create a bot at https://t.me/BotFather
@@ -17,9 +17,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 # ─── Agent Behaviour ──────────────────────────────────────────────────────────
-TOP_NEWS_COUNT = 13
-MIN_IMPACT_SCORE = 5
-REQUEST_DELAY = 1.0
+TOP_NEWS_COUNT = 15
+MIN_IMPACT_SCORE = 6
+REQUEST_DELAY = 1.2
 
 # ─── News Sources ─────────────────────────────────────────────────────────────
 NEWS_SOURCES = {
@@ -32,6 +32,10 @@ NEWS_SOURCES = {
     "financial_express": True,
     "the_hindu_businessline": True,
     "zeebiz": True,
+    "business_today": True,
+    "inc42": True,
+    "sebi": True,
+    "investing_india": True,
 }
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
