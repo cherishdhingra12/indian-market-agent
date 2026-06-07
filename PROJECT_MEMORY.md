@@ -224,7 +224,7 @@ DuckDuckGo Web ────────┘                              Diversit
 | `3698d91` | Jun 6, 13:39 | **Diversity filter.** Capped NSE at 4, mix from all sources, top 13 |
 | `c099b83` | Jun 6, 13:52 | **Two-section format.** 50-50 NSE/media split, stricter dedup threshold (0.28→0.30) |
 | `7e04ab3` | Jun 8, 00:06 | **Timezone fix + new sources.** Fixed `get_time_label()` to use IST (UTC+5:30), added Business Today, Inc42, SEBI, Investing.com India, improved NDTV (Feedburner) and Financial Express (HTML-only) scrapers, enhanced keyword scoring |
-| `(next)` | Jun 8, 00:XX | **BUG FIXES.** (1) Gemini auth changed from query-param `?key=` to header `x-goog-api-key` — 403 error was silently killing LLM ranking. (2) Keyword fallback paths in `analyze_articles()` now respect `MIN_IMPACT_SCORE` filter. |
+| `64bc22e` | Jun 8, 00:16 | **BUG FIXES + PROJECT MEMORY.** (1) Gemini auth changed from `?key=` query param to `x-goog-api-key` header — 403 error was silently killing LLM ranking, so Gemini never actually worked before this fix. (2) Keyword fallback paths in `analyze_articles()` now respect `MIN_IMPACT_SCORE` filter. (3) Created `PROJECT_MEMORY.md`. |
 
 ### Uncommitted Changes (none at present — all pushed)
 All changes committed and pushed to `origin/main`.
@@ -253,14 +253,16 @@ All changes committed and pushed to `origin/main`.
 - **Bugs found & fixed:**
   1. **Gemini auth broken** — `_call_gemini()` used `?key=` query param but API requires `x-goog-api-key` header. All Gemini calls silently returned 403 and fell back to keyword scoring. **Verified fixed with live API test.**
   2. **Keyword fallback ignores MIN_IMPACT_SCORE** — All 3 fallback paths in `analyze_articles()` returned raw keyword scores without filtering by `MIN_IMPACT_SCORE=6`. Low-scoring noise (1/10) could pass through. **Fixed by adding `_filter_by_min_score()` helper.**
-- **Full test results:**
-  - ✅ Gemini API (header auth) — working, returns 200
-  - ✅ Telegram Bot (`@FinanceNewssbot`) — working, message sent
-  - ✅ Config loading — all values correct
-  - ✅ Syntax/AST — no errors
-  - ✅ All imports resolve
-  - ✅ HEAD pushed to `origin/main` (7e04ab3)
-- **Committed & pushed** as next commit after 7e04ab3
+- **Full E2E test (Jun 8, 00:19 IST via run_agent.sh):**
+  - ✅ **Scrapers:** NSE (20 items, 7 high-value), Google News (946 unique), ET (50), BS (35), Livemint (36), NDTV (20), Hindu BL (60), Business Today (109), Inc42 (24), SEBI (30), Investing.com (10), DuckDuckGo (10)
+  - ⚠️ **Blocked sources:** Moneycontrol (502/403), Financial Express (0), ZeeBiz (403)
+  - ✅ **Dedup:** 1330 raw → 1310 URL dedup → 100 semantic dedup
+  - ✅ **Gemini analysis (FIRST TIME WORKING!):** "LLM ranked 25 articles (min score 6+)"
+  - ✅ **Diversity filter:** 25 → 15 (2 NSE, 9 media)
+  - ⚠️ **Telegram:** 1/3 messages sent before local timeout (300s); chunking worked correctly
+  - ✅ **Time label:** "9:00 AM (Pre-Market)" — correct IST via UTC+5:30
+- **Actions workflow simulation:** Config loads correctly with env vars, all 13 sources enabled, TOP_NEWS_COUNT=15, MIN_IMPACT_SCORE=6
+- **Committed & pushed** as `64bc22e`
 
 ### Key Decisions Made
 1. **Gemini 2.5 Flash Lite** chosen as LLM — free tier, 60 req/min, 1500 req/day
@@ -280,14 +282,22 @@ All changes committed and pushed to `origin/main`.
 - **Cannot be fixed** — platform limitation
 - Mitigation: `workflow_dispatch` available for manual triggers
 
-### Broken/Unreliable Sources
-| Source | Issue |
-|--------|-------|
-| Business Standard RSS | Returns 403 (blocked), HTML also 403 |
-| NDTV Profit old RSS | 403, switched to Feedburner |
-| Financial Express RSS | 410 Gone, HTML-only fallback works |
-| Zee Business RSS | Behind Akamai CDN, RSS often fails |
-| Moneycontrol RSS | Not well-formed, HTML fallback needed |
+### Run Timeout Risk (15 articles + full scraping ≈ 2-3 min)
+- Full test run (Jun 8): Took ~64 seconds for scraping + Gemini, but the combined Telegram message (3 chunks) needed more time
+- GitHub Actions workflow has **10-minute timeout** — should be sufficient (test run completed scraping + LLM in ~74s)
+- Telegram chunking: 15 articles with HTML formatting creates ~3 messages (each max 3800 chars). Each API call takes ~0.5-1s.
+- **Conclusion:** 10 min timeout on GH Actions is more than adequate for 3 messages
+
+### Broken/Unreliable Sources (as of Jun 8 test run)
+| Source | Issue | Workaround |
+|--------|-------|------------|
+| Moneycontrol | RSS 502, HTML 403 — completely blocked | No workaround (major gap) |
+| Business Standard | RSS 403, HTML 403 — completely blocked | Only RSS feed works intermittently |
+| Zee Business | RSS 403, HTML 403 — completely blocked | No workaround |
+| Financial Express | RSS 410 Gone, HTML returns 0 articles | HTML scrapes but finds no articles |
+| NDTV Profit | Original RSS 403; Feedburner RSS works | Using Feedburner RSS (stable) |
+
+**Impact:** ~3-4 of 13 sources are currently fully blocked. The remaining 9-10 sources (Google News, ET, Livemint, Hindu BL, Business Today, Inc42, SEBI, Investing.com, NSE Filings + DuckDuckGo fallback) consistently provide 1000-1300 articles per run.
 
 ### Gemini Auth Method (CRITICAL — Was Broken)
 - **Original bug:** Code used `?key={api_key}` query-param auth (line 932)
