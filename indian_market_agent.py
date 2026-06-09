@@ -29,6 +29,8 @@ from html import unescape
 import requests
 from bs4 import BeautifulSoup
 
+from insider_scrapers import collect_insider_news
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -65,6 +67,8 @@ def load_config() -> dict:
             "min_impact_score": getattr(cfg, "MIN_IMPACT_SCORE", 5),
             "request_delay": getattr(cfg, "REQUEST_DELAY", 1.5),
             "news_sources": getattr(cfg, "NEWS_SOURCES", {}),
+            "insider_sources": getattr(cfg, "INSIDER_SOURCES", {}),
+            "insider_top_news_count": getattr(cfg, "INSIDER_TOP_NEWS_COUNT", 10),
             "today": getattr(cfg, "TODAY", date.today().strftime("%B %d, %Y")),
             "schedule_label": getattr(cfg, "SCHEDULE_LABEL", {}),
         }
@@ -88,6 +92,8 @@ def _default_config() -> dict:
         "min_impact_score": int(os.environ.get("MIN_IMPACT_SCORE", "5")),
         "request_delay": float(os.environ.get("REQUEST_DELAY", "1.5")),
         "news_sources": {},
+        "insider_sources": {},
+        "insider_top_news_count": 10,
         "today": date.today().strftime("%B %d, %Y"),
         "schedule_label": {"0900": "9:00 AM", "1400": "2:00 PM", "1900": "7:00 PM"},
     }
@@ -775,7 +781,17 @@ def _similarity(a: str, b: str) -> float:
 # Source authority ranking (higher = more credible)
 SOURCE_PRIORITY = {
     "NSE Filing": 10,
+    "NSE Bulk Deal": 9,
+    "NSE Block Deal": 9,
+    "NSE Insider Trade": 9,
+    "NSE SAST": 9,
+    "NSE Pledge": 9,
+    "NSE Rating Change": 8,
     "SEBI": 9,
+    "SEBI Order": 8,
+    "BSE Filing": 8,
+    "BSE Insider Trade": 8,
+    "PIB Release": 7,
     "Moneycontrol": 5,
     "Economic Times": 5,
     "Business Standard": 5,
@@ -1241,18 +1257,103 @@ def _keyword_reason(text: str, score: int, matched_kws: list = None) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────
+#  Insider News Analysis (Separate from General News)
+# ──────────────────────────────────────────────────────────────────────
+
+INSIDER_ANALYSIS_PROMPT = """You are an expert Indian stock market analyst specializing in exchange filings and insider signals.
+
+Your ONLY task: Analyze these exchange filing / insider trading signals and rank them by HOW LIKELY they are to move stock prices today.
+
+Every article must have a "type" field:
+- "insider_buy": Promoter/DII insider buying — bullish signal
+- "insider_sell": Promoter/DII insider selling — bearish signal
+- "bulk_deal": Large institutional bulk/block deal — shows smart money movement
+- "pledge": Promoter pledge creation or release — distress or confidence
+- "regulatory": SEBI order, regulatory action — can be strongly positive or negative
+- "policy": Government/PIB announcement — sector or economy-wide impact
+- "rating": Credit rating upgrade/downgrade — directly affects bond/stock pricing
+- "filing": General corporate filing (announcement, board outcome, order win)
+
+RATING SCALE (market_impact_score 1-10):
+- 10: Major Nifty50 insider buy/bulk deal, SEBI ban on large company, rating upgrade of large cap
+- 8-9: Significant insider trade (₹10Cr+), block deal, rating downgrade, SEBI investigation on mid-cap
+- 6-7: Moderate insider trade, bulk deal, pledge release, small-cap rating change
+- 4-5: Minor insider trade, routine filing, minor SEBI order
+- 1-3: Noise. Exclude.
+
+CRITICAL: These are EARLY SIGNALS from exchange filings. They have higher information value because they haven't been reported by media yet. Score them generously — a legitimate insider buy is usually a 7+ even for small-caps.
+
+Return ONLY raw JSON array. Objects: title, source, url, market_impact_score (integer 1-10), type, reason (name stocks and what the signal means).
+
+Articles:{articles_json}
+"""
+
+
+def analyze_insider_articles(articles: List[Dict], config: dict) -> List[Dict]:
+    """Use LLM to analyze and rank insider/signal articles by market impact."""
+    if not articles:
+        log.warning("No insider articles to analyze")
+        return []
+
+    top_n = config.get("insider_top_news_count", 10)
+    min_score = 5  # slightly lower threshold for insider signals
+
+    def _filter_by_min_score(articles_list):
+        return [a for a in articles_list if a.get("market_impact_score", 0) >= min_score]
+
+    if config.get("llm_provider") == "none" or not config.get("llm_api_key") or "YOUR_" in config.get("llm_api_key", ""):
+        log.info("LLM not configured — using keyword-based fallback for insider articles")
+        return _filter_by_min_score(_keyword_score(articles, top_n))
+
+    # Pre-filter to top 30 candidates
+    pre_scored = _keyword_score(articles, 40)
+    candidates = pre_scored[:30]
+
+    articles_for_prompt = [
+        {"title": a["title"], "source": a["source"], "url": a.get("url", ""), "snippet": a.get("snippet", "")[:150]}
+        for a in candidates
+    ]
+
+    prompt = INSIDER_ANALYSIS_PROMPT.format(
+        articles_json=json.dumps(articles_for_prompt, ensure_ascii=False, indent=2),
+    )
+
+    messages = [
+        {"role": "system", "content": "You are a precise JSON-only assistant. Never include markdown or explanations outside the JSON."},
+        {"role": "user", "content": prompt},
+    ]
+
+    response = call_llm(messages, config)
+    if not response:
+        log.warning("LLM returned empty response for insider — using keyword fallback")
+        return _filter_by_min_score(_keyword_score(articles, top_n))
+
+    ranked = _parse_llm_response(response)
+    if not ranked:
+        log.warning("Could not parse LLM response for insider — using keyword fallback")
+        return _filter_by_min_score(_keyword_score(articles, top_n))
+
+    ranked = [a for a in ranked if a.get("market_impact_score", 0) >= min_score]
+    ranked.sort(key=lambda x: x.get("market_impact_score", 0), reverse=True)
+    log.info(f"Insider LLM ranked {len(ranked)} articles (min score {min_score}+)")
+
+    return ranked[:top_n]
+
+
+# ──────────────────────────────────────────────────────────────────────
 #  Telegram Notifier
 # ──────────────────────────────────────────────────────────────────────
 
-def send_telegram(articles: List[Dict], time_label: str, config: dict) -> bool:
-    """Send ranked news articles to Telegram."""
+def send_telegram(articles: List[Dict], time_label: str, config: dict,
+                  insider_articles: Optional[List[Dict]] = None) -> bool:
+    """Send ranked news articles to Telegram with optional Insider News section."""
     token = config.get("telegram_bot_token", "")
     chat_id = config.get("telegram_chat_id", "")
     if not token or "YOUR_" in token or not chat_id or "YOUR_" in chat_id:
         log.warning("Telegram not configured. Set bot token and chat ID in config.py")
         return False
 
-    formatted = _format_message(articles, time_label, config)
+    formatted = _format_message(articles, time_label, config, insider_articles=insider_articles)
     if not formatted:
         log.warning("No news to send")
         return False
@@ -1281,9 +1382,10 @@ def send_telegram(articles: List[Dict], time_label: str, config: dict) -> bool:
     return success
 
 
-def _format_message(articles: List[Dict], time_label: str, config: dict) -> str:
-    """Format articles into a readable HTML message with two sections."""
-    if not articles:
+def _format_message(articles: List[Dict], time_label: str, config: dict,
+                    insider_articles: Optional[List[Dict]] = None) -> str:
+    """Format articles into a readable HTML message with INSIDER + GENERAL sections."""
+    if not articles and not insider_articles:
         return ""
 
     today = config.get("today", date.today().strftime("%B %d, %Y"))
@@ -1292,15 +1394,12 @@ def _format_message(articles: List[Dict], time_label: str, config: dict) -> str:
     lines.append("=" * 40)
     lines.append("")
 
-    # Split into stock-specific and index-movers
-    stock_items = [a for a in articles if a.get("type") == "stock"]
-    index_items = [a for a in articles if a.get("type") != "stock"]
-
-    # Stock-specific section
-    if stock_items:
-        lines.append("<b>--- STOCK-SPECIFIC CATALYSTS ---</b>")
+    # ── INSIDER NEWS SECTION (Early signals from exchange filings) ──
+    if insider_articles:
+        lines.append("<b>🔴 INSIDER NEWS — Early Signals</b>")
+        lines.append("<i>Exchange filings & regulatory data — unreported by mainstream media</i>")
         lines.append("")
-        for i, article in enumerate(stock_items, 1):
+        for i, article in enumerate(insider_articles, 1):
             title = article.get("title", "Untitled")
             source = article.get("source", "Unknown")
             url = article.get("url", "")
@@ -1311,32 +1410,64 @@ def _format_message(articles: List[Dict], time_label: str, config: dict) -> str:
             lines.append(f"<b>{i}. {title}</b>")
             lines.append(f"   Source: {source}")
             if url:
-                lines.append(f"   <a href='{url}'>Read full article</a>")
+                lines.append(f"   <a href='{url}'>Read filing</a>")
             lines.append(f"   Impact: {bars} ({score}/10)")
             if reason:
                 lines.append(f"   Why: {reason}")
             lines.append("")
 
-    # Index movers section
-    if index_items:
-        lines.append("<b>--- INDEX MOVERS & BREAKING NEWS ---</b>")
+    # ── GENERAL NEWS SECTION (Mainstream media) ──
+    if articles:
+        if insider_articles:
+            lines.append("=" * 40)
+            lines.append("")
+
+        lines.append("<b>📰 GENERAL NEWS — Media Reports</b>")
         lines.append("")
-        for i, article in enumerate(index_items, len(stock_items) + 1):
-            title = article.get("title", "Untitled")
-            source = article.get("source", "Unknown")
-            url = article.get("url", "")
-            score = article.get("market_impact_score", "?")
-            reason = article.get("reason", "")
 
-            bars = "|" * (min(score, 10) if isinstance(score, int) else 0)
-            lines.append(f"<b>{i}. {title}</b>")
-            lines.append(f"   Source: {source}")
-            if url:
-                lines.append(f"   <a href='{url}'>Read full article</a>")
-            lines.append(f"   Impact: {bars} ({score}/10)")
-            if reason:
-                lines.append(f"   Why: {reason}")
+        # Split into stock-specific and index-movers
+        stock_items = [a for a in articles if a.get("type") == "stock"]
+        index_items = [a for a in articles if a.get("type") != "stock"]
+
+        if stock_items:
+            lines.append("<b>--- STOCK-SPECIFIC CATALYSTS ---</b>")
             lines.append("")
+            for i, article in enumerate(stock_items, 1):
+                title = article.get("title", "Untitled")
+                source = article.get("source", "Unknown")
+                url = article.get("url", "")
+                score = article.get("market_impact_score", "?")
+                reason = article.get("reason", "")
+
+                bars = "|" * (min(score, 10) if isinstance(score, int) else 0)
+                lines.append(f"<b>{i}. {title}</b>")
+                lines.append(f"   Source: {source}")
+                if url:
+                    lines.append(f"   <a href='{url}'>Read full article</a>")
+                lines.append(f"   Impact: {bars} ({score}/10)")
+                if reason:
+                    lines.append(f"   Why: {reason}")
+                lines.append("")
+
+        if index_items:
+            lines.append("<b>--- INDEX MOVERS & BREAKING NEWS ---</b>")
+            lines.append("")
+            for i, article in enumerate(index_items, len(stock_items) + 1):
+                title = article.get("title", "Untitled")
+                source = article.get("source", "Unknown")
+                url = article.get("url", "")
+                score = article.get("market_impact_score", "?")
+                reason = article.get("reason", "")
+
+                bars = "|" * (min(score, 10) if isinstance(score, int) else 0)
+                lines.append(f"<b>{i}. {title}</b>")
+                lines.append(f"   Source: {source}")
+                if url:
+                    lines.append(f"   <a href='{url}'>Read full article</a>")
+                lines.append(f"   Impact: {bars} ({score}/10)")
+                if reason:
+                    lines.append(f"   Why: {reason}")
+                lines.append("")
 
     lines.append("=" * 40)
     lines.append("Market Intel Agent | Next update in ~5-7 hours")
@@ -1456,7 +1587,7 @@ def get_time_label(config: dict) -> str:
 
 
 def main():
-    """Main entry point for the agent."""
+    """Main entry point for the agent — collects & sends both Insider and General News."""
     log.info("=" * 60)
     log.info("Indian Market News Agent — Starting run")
 
@@ -1464,42 +1595,63 @@ def main():
     time_label = get_time_label(config)
     log.info(f"Schedule slot: {time_label}")
 
-    # Step 1: Collect news from all sources
-    log.info("Step 1: Collecting news from sources...")
+    # ── Step 1A: Collect insider news (early signals from exchange filings) ──
+    log.info("Step 1A: Collecting insider / early-signal news from exchange filings...")
+    insider_articles = collect_insider_news(config)
+    insider_ranked = []
+    if insider_articles:
+        log.info(f"Step 2A: Analyzing {len(insider_articles)} insider articles...")
+        insider_ranked = analyze_insider_articles(insider_articles, config)
+        log.info(f"Insider analysis: {len(insider_ranked)} ranked articles")
+    else:
+        log.info("No insider articles collected")
+
+    # ── Step 1B: Collect general news (mainstream media) ──
+    log.info("Step 1B: Collecting general news from sources...")
     articles = collect_news(config)
 
+    ranked = []
     if not articles:
-        log.warning("No articles collected from any source")
-        print("NO_NEWS_COLLECTED")
-        return
+        log.warning("No general news articles collected from any source")
+    else:
+        log.info(f"Step 2B: Analyzing {len(articles)} general articles for market impact...")
+        ranked = analyze_articles(articles, config)
 
-    # Step 2: Analyze and rank by market impact
-    log.info(f"Step 2: Analyzing {len(articles)} articles for market impact...")
-    ranked = analyze_articles(articles, config)
-
-    if not ranked:
+    if not ranked and not insider_ranked:
         log.warning("No articles passed impact threshold")
         print("NO_IMPACTFUL_NEWS")
         return
 
-    # Step 3: Send to Telegram
-    log.info(f"Step 3: Sending top {len(ranked)} articles to Telegram...")
-    sent = send_telegram(ranked, time_label, config)
+    # ── Step 3: Send to Telegram (both sections in one message) ──
+    total = len(ranked) + len(insider_ranked)
+    log.info(f"Step 3: Sending {total} articles to Telegram ({len(insider_ranked)} insider + {len(ranked)} general)...")
+    sent = send_telegram(ranked, time_label, config, insider_articles=insider_ranked)
 
     # Console output
     print(f"\n{'='*60}")
-    print(f"TOP {len(ranked)} MARKET-MOVING NEWS — {time_label}")
+    print(f"MARKET NEWS — {time_label}")
     print(f"{'='*60}")
-    for i, a in enumerate(ranked, 1):
-        print(f"{i}. [{a.get('market_impact_score', '?')}/10] {a['title']}")
-        print(f"   Source: {a['source']} | Impact: {a.get('reason', '')}")
-        print(f"   URL: {a.get('url', '')}")
+
+    if insider_ranked:
+        print(f"\n--- INSIDER NEWS ({len(insider_ranked)} items) ---")
+        for i, a in enumerate(insider_ranked, 1):
+            print(f"{i}. [{a.get('market_impact_score', '?')}/10] {a['title']}")
+            print(f"   Source: {a['source']} | {a.get('reason', '')}")
+            print(f"   URL: {a.get('url', '')}")
+
+    if ranked:
+        print(f"\n--- GENERAL NEWS ({len(ranked)} items) ---")
+        for i, a in enumerate(ranked, 1):
+            print(f"{i}. [{a.get('market_impact_score', '?')}/10] {a['title']}")
+            print(f"   Source: {a['source']} | {a.get('reason', '')}")
+            print(f"   URL: {a.get('url', '')}")
+
     print(f"{'='*60}")
     print(f"Telegram sent: {sent}")
     print(f"{'='*60}\n")
 
     log.info("Agent run completed successfully")
-    return ranked
+    return {"general": ranked, "insider": insider_ranked}
 
 
 if __name__ == "__main__":

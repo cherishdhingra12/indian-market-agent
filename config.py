@@ -21,7 +21,7 @@ TOP_NEWS_COUNT = 15
 MIN_IMPACT_SCORE = 6
 REQUEST_DELAY = 1.2
 
-# ─── News Sources ─────────────────────────────────────────────────────────────
+# ─── News Sources (General / Mainstream Media) ───────────────────────────────
 NEWS_SOURCES = {
     "nse_announcements": True,
     "moneycontrol": True,
@@ -37,6 +37,22 @@ NEWS_SOURCES = {
     "sebi": True,
     "investing_india": True,
 }
+
+# ─── Insider News Sources (Early-Signal / Exchange Filings) ───────────────────
+# All public, legitimate sources that publish BEFORE mainstream media reports.
+INSIDER_SOURCES = {
+    "nse_bulk_deals": True,
+    "nse_block_deals": True,
+    "nse_insider_trading": True,
+    "nse_sast": True,
+    "nse_pledge": True,
+    "bse_announcements": True,
+    "bse_insider_trading": True,
+    "sebi_orders": True,
+    "pib_releases": True,
+    "nse_credit_ratings": True,
+}
+INSIDER_TOP_NEWS_COUNT = 10
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 TODAY = date.today().strftime("%B %d, %Y")

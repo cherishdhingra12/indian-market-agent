@@ -2,9 +2,9 @@
 
 ## 1. PROJECT OVERVIEW
 
-An automated **Indian Financial Market News Agent** that scrapes financial news from 17+ sources, ranks them by stock market impact using Google Gemini AI, and delivers the top stories to Telegram 3x daily (9 AM, 2 PM, 7 PM IST).
+An automated **Indian Financial Market News Agent** that scrapes both mainstream financial news AND early-signal exchange filings, ranks them by stock market impact using Google Gemini AI, and delivers the top stories to Telegram 3x daily (9 AM, 2 PM, 7 PM IST) in two sections: **🔴 INSIDER NEWS** (exchange filings/regulatory data) and **📰 GENERAL NEWS** (mainstream media).
 
-**Purpose:** Give retail traders early access to market-moving news before it hits mainstream — NSE corporate filings (real-time exchange data) combined with media coverage, analyzed and ranked by AI.
+**Purpose:** Give retail traders early access to market-moving news before it hits mainstream — NSE corporate filings, bulk/block deals, insider trading disclosures, SEBI orders, and PIB releases combined with media coverage, analyzed and ranked by AI.
 
 **Deployment:** GitHub Actions (free cloud, 3x daily UTC cron mapped to IST).
 
@@ -14,28 +14,56 @@ An automated **Indian Financial Market News Agent** that scrapes financial news 
 
 ## 2. ARCHITECTURE & DATA FLOW
 
+### Dual Pipeline
 ```
-NSE Corporate Filings ─┐
-Google News RSS ───────┤
-Moneycontrol RSS/HTML ─┤
-Economic Times ────────┤
-Business Standard ─────┤
-Livemint ──────────────┤──▶ col─lect_news() ──▶ URL dedup ──▶ Semantic dedup ──▶ analyze_articles() ──▶ Telegram
-NDTV Profit ───────────┤                                (60-1300 raw)   (100 unique)
-Financial Express ─────┤
-Hindu BusinessLine ────┤                                      │
-Zee Business ──────────┤                              Keyword pre-filter
-Business Today ────────┤                              (top 60 → top 40)
-Inc42 ─────────────────┤                                      │
-SEBI ──────────────────┤                              Gemini 2.5 Flash Lite
-Investing.com India ───┤                              (final ranking, top 7-15)
-DuckDuckGo Web ────────┘                              Diversity filter (50-50 NSE/media)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  INSIDER PIPELINE (Early Signals — Exchange Filings)                        │
+│                                                                             │
+│  NSE Bulk Deals ─────┐                                                     │
+│  NSE Block Deals ────┤                                                     │
+│  NSE Insider Trading ─┤──▶ collect_insider_news() ──▶ analyze_insider_() ──┐│
+│  NSE SAST ───────────┤        (196 raw, 33 unique)    (Gemini, top 10)    ││
+│  NSE Pledge ─────────┤                                                     ││
+│  SEBI Orders ────────┤                                                     ││
+│  PIB Releases ───────┘                                                     ││
+│                                                                             ││
+├─────────────────────────────────────────────────────────────────────────────┤│
+│  GENERAL PIPELINE (Mainstream Media)                     ┌──────────────────┘│
+│                                                          │                   │
+│  NSE Corporate Filings ─┐                  ┌─────────────┘                   │
+│  Google News RSS ───────┤                  ▼                                 │
+│  Moneycontrol ──────────┤                                                  │
+│  Economic Times ────────┤                                                  │
+│  Business Standard ─────┤──▶ collect_news() ──▶ analyze_articles() ──┐     │
+│  Livemint ──────────────┤    (1300 raw, 100 unique)  (Gemini, top 15) │     │
+│  NDTV Profit ───────────┤                                               │     │
+│  Hindu BusinessLine ────┤                                               │     │
+│  Business Today ────────┤                                               │     │
+│  Inc42 ─────────────────┤                                               │     │
+│  SEBI ──────────────────┤                                               │     │
+│  DuckDuckGo ────────────┘                                               │     │
+│                                                                         │     │
+└─────────────────────────────────────────────────────────────────────────┘     │
+                                                                                 │
+                            ┌───────────────────────────────────────────────────┘
+                            ▼
+              _format_message(insider_articles, articles)
+              ┌──────────────────────────────┐
+              │ 🔴 INSIDER NEWS              │
+              │   • 10 ranked insider items   │
+              ├──────────────────────────────┤
+              │ 📰 GENERAL NEWS              │
+              │   • 15 ranked media items     │
+              └──────────────┬───────────────┘
+                             ▼
+                    send_telegram() → 3-4 chunks
 ```
 
-**Pipeline (3 steps in main()):**
-1. `collect_news()` — Tier 0: NSE → Tier 1: Google News → Tier 2: Site scrapers → Tier 3: DuckDuckGo
-2. `analyze_articles()` — Keyword pre-filter → Gemini LLM → Source diversity filter
-3. `send_telegram()` — Format as two-section HTML message → Send via Telegram Bot API
+**Pipeline (4 steps in main()):**
+1. `collect_insider_news()` — NSE bulk/block deals → NSE corporate filings (insider/SAST/pledge/ratings) → SEBI RSS → PIB HTML
+2. `analyze_insider_articles()` — Insider-specific Gemini prompt → top 10
+3. `collect_news()` + `analyze_articles()` — Existing 13 mainstream sources (unchanged)
+4. `send_telegram()` — Format as dual-section INSIDER + GENERAL HTML → Send via Telegram Bot API
 
 ---
 
@@ -43,8 +71,9 @@ DuckDuckGo Web ────────┘                              Diversit
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `indian_market_agent.py` | 1503 | Main agent: all scraping, analysis, LLM, Telegram logic |
-| `config.py` | 48 | Configuration constants (LLM, Telegram, sources, thresholds) |
+| `indian_market_agent.py` | ~1640 | Main agent: scraping, LLM, Telegram, dual-section pipeline |
+| `insider_scrapers.py` | ~500 | Early-signal scrapers: NSE bulk/block, insider, SAST, pledge, ratings, SEBI orders, PIB, BSE |
+| `config.py` | ~55 | Configuration: LLM, Telegram, both NEWS_SOURCES + INSIDER_SOURCES |
 | `.env` | N/A | API keys (gitignored, loaded by run_agent.sh) |
 | `.env.example` | 17 | Template for .env |
 | `requirements.txt` | 3 | `requests>=2.31.0`, `beautifulsoup4>=4.12.0`, `lxml>=5.0.0` |
@@ -77,20 +106,28 @@ DuckDuckGo Web ────────┘                              Diversit
 - `REQUEST_DELAY = 1.2` — Seconds between API requests
 - `SCHEDULE_LABEL` — Display labels for 3 time slots
 
-### News Sources (all enabled by default)
+### News Sources — General (all enabled by default)
 `nse_announcements`, `moneycontrol`, `economictimes`, `business_standard`, `livemint`, `ndtv_profit`, `financial_express`, `the_hindu_businessline`, `zeebiz`, `business_today`, `inc42`, `sebi`, `investing_india`
+
+### Insider Sources — Early Signals (all enabled by default)
+`nse_bulk_deals`, `nse_block_deals`, `nse_insider_trading`, `nse_sast`, `nse_pledge`, `bse_announcements`, `bse_insider_trading`, `sebi_orders`, `pib_releases`, `nse_credit_ratings`
+
+### Insider Behaviour
+- `INSIDER_TOP_NEWS_COUNT = 10` — Max insider articles in Telegram
 
 ---
 
-## 5. COMPLETE FUNCTION MAP (indian_market_agent.py)
+## 5. COMPLETE FUNCTION MAP
 
-### Configuration & Startup
+### indian_market_agent.py
+
+#### Configuration & Startup
 | Line | Function | Purpose |
 |------|----------|---------|
 | 50 | `load_config()` | Load config from config.py module with fallback to env vars |
 | 76 | `_default_config()` | Fallback defaults when config.py unavailable |
 
-### HTTP Utilities
+#### HTTP Utilities
 | Line | Function | Purpose |
 |------|----------|---------|
 | 100 | `USER_AGENTS` | 4 rotating User-Agent strings for anti-blocking |
@@ -99,7 +136,7 @@ DuckDuckGo Web ────────┘                              Diversit
 | 142 | `_fetch_text()` | Fetch URL → raw text |
 | 154 | `_fetch_bytes()` | Fetch URL → raw bytes (preserves encoding) |
 
-### RSS Feed Parser
+#### RSS Feed Parser
 | Line | Function | Purpose |
 |------|----------|---------|
 | 170 | `_parse_rss()` | Parse RSS 2.0 and Atom feeds → List[Dict] |
@@ -107,7 +144,7 @@ DuckDuckGo Web ────────┘                              Diversit
 | 220 | `_atom_text()` | Extract text from Atom XML element |
 | 225 | `_atom_link()` | Extract href from Atom link element |
 
-### Source-Specific Scrapers
+#### Source-Specific Scrapers (General News)
 | Line | Function | Source | Method |
 |------|----------|--------|--------|
 | 237 | `scrape_moneycontrol()` | Moneycontrol | RSS + HTML fallback |
@@ -123,14 +160,14 @@ DuckDuckGo Web ────────┘                              Diversit
 | 477 | `scrape_sebi()` | SEBI | RSS only (regulatory) |
 | 482 | `scrape_investing_india()` | Investing.com India | RSS only |
 
-### NSE Corporate Announcements (Early Signals)
+#### NSE Corporate Announcements (Early Signals)
 | Line | Function | Purpose |
 |------|----------|---------|
 | 491 | `HIGH_VALUE_CATS` | Set of high-impact categories: board outcomes, order wins, appointments, analyst meets, updates |
 | 504 | `scrape_nse_announcements()` | Real-time NSE exchange filings via NSE API (`/api/corporate-announcements`) |
 | 556 | `scrape_nse_high_value()` | Filters NSE filings to only HIGH_VALUE_CATS |
 
-### Google News RSS
+#### Google News RSS
 | Line | Function | Purpose |
 |------|----------|---------|
 | 572 | `GOOGLE_NEWS_RSS` | Single broad Google News RSS query |
@@ -138,22 +175,22 @@ DuckDuckGo Web ────────┘                              Diversit
 | 583 | `GOOGLE_NEWS_QUERIES` | 10 focused queries (stock market, RBI, FII, IPO, commodities, etc.) |
 | 597 | `search_google_news_multi()` | Multi-query Google News search with dedup |
 
-### DuckDuckGo Web Search (Fallback)
+#### DuckDuckGo Web Search (Fallback)
 | Line | Function | Purpose |
 |------|----------|---------|
 | 626 | `search_duckduckgo()` | Single DDG query → articles with redirect URL extraction |
 | 671 | `search_breaking_news()` | 10 targeted DDG queries for enrichment |
-| 707 | `_infer_source()` | Map URL domain → human-readable source name (25 sources mapped) |
+| 707 | `_infer_source()` | Map URL domain → human-readable source name (25+ sources mapped) |
 
-### Semantic Deduplication
+#### Semantic Deduplication
 | Line | Function | Purpose |
 |------|----------|---------|
 | 747 | `_normalize()` | Lowercase, strip punctuation, remove stopwords |
 | 764 | `_similarity()` | Jaccard similarity of two normalized strings |
-| 775 | `SOURCE_PRIORITY` | Authority ranking: NSE(10) > SEBI(9) > Media(4-5) > Aggregators(2-3) |
+| 775 | `SOURCE_PRIORITY` | Authority ranking: NSE(10) > Insider(9) > Media(4-5) > Aggregators(2-3) |
 | 795 | `_deduplicate_semantic()` | Quality-scored dedup: prefers authoritative source, caps at 100 articles, threshold=0.30 |
 
-### LLM News Analyzer
+#### LLM News Analyzer (General)
 | Line | Function | Purpose |
 |------|----------|---------|
 | 843 | `call_llm()` | Route to correct provider based on config |
@@ -167,19 +204,58 @@ DuckDuckGo Web ────────┘                              Diversit
 | 1114 | `_keyword_score()` | Fallback if LLM unavailable: Nifty50 + catalyst keywords → 1-10 score |
 | 1229 | `_keyword_reason()` | Generate reason text based on score tier |
 
-### Telegram Notifier
+#### Insider News Analysis (Separate LLM)
 | Line | Function | Purpose |
 |------|----------|---------|
-| 1244 | `send_telegram()` | Send formatted articles via Telegram Bot API, handles split messages |
-| 1281 | `_format_message()` | Two-section HTML: "Stock-Specific Catalysts" + "Index Movers & Breaking News" |
-| 1344 | `_split_message()` | Split long messages at paragraph boundaries, max 3800 chars each |
+| 1253 | `INSIDER_ANALYSIS_PROMPT` | Insider-specific prompt: insider_buy/sell, bulk_deal, pledge, regulatory, policy, rating, filing types |
+| 1298 | `analyze_insider_articles()` | Keyword pre-filter → Gemini with insider prompt → top 10 |
 
-### Main Orchestrator
+#### Telegram Notifier
 | Line | Function | Purpose |
 |------|----------|---------|
-| 1371 | `collect_news()` | Execute all scrapers in tiers, URL dedup, semantic dedup |
-| 1443 | `get_time_label()` | Determine IST time slot label (uses UTC+5:30) |
-| 1454 | `main()` | Entry point: collect → analyze → send → print summary |
+| 1337 | `send_telegram()` | Send formatted articles with optional insider_articles param |
+| 1374 | `_format_message()` | Dual-section HTML: "🔴 INSIDER NEWS" then "📰 GENERAL NEWS" with stock/index split |
+| 1447 | `_split_message()` | Split long messages at paragraph boundaries, max 3800 chars each |
+
+#### Main Orchestrator
+| Line | Function | Purpose |
+|------|----------|---------|
+| 1495 | `collect_news()` | Execute all general scrapers in tiers, URL dedup, semantic dedup |
+| 1567 | `get_time_label()` | Determine IST time slot label (uses UTC+5:30) |
+| 1579 | `main()` | Entry point: collect insider → analyze insider → collect general → analyze general → send dual-section → print |
+
+### insider_scrapers.py (Separate Module)
+
+#### Internal Helpers
+| Function | Purpose |
+|----------|---------|
+| `_session()` | Requests.Session with rotating UA (same pattern as main agent) |
+| `_fetch_soup()` | Fetch URL → BeautifulSoup |
+| `_nse_session()` | NSE-primed session with cookies |
+| `_nse_corp_announcements()` | Fetch raw corporate announcements list from NSE API |
+| `_nse_corp_filings_by_keywords()` | Filter corp announcements by keyword group matching (used by insider, SAST, pledge, ratings) |
+| `_scrape_nse_large_deals()` | Bulk + block deals from `/api/snapshot-capital-market-largedeal` |
+| `_parse_rss_lenient()` | RSS parser with &amp; entity fixing for malformed feeds |
+| `_scrape_pib_html()` | PIB HTML fallback from indexd.aspx |
+
+#### Insider Scrapers
+| Function | Source | Method | Typical Items |
+|----------|--------|--------|:------------:|
+| `scrape_nse_bulk_deals()` | NSE Bulk Deals | `/api/snapshot-capital-market-largedeal?mode=bulk_deals` | 141 |
+| `scrape_nse_block_deals()` | NSE Block Deals | `/api/snapshot-capital-market-largedeal?mode=block_deals` | 9 |
+| `scrape_nse_insider_trading()` | NSE Insider Trading | Corp announcements keyword filter (PIT regulations) | 0-5 |
+| `scrape_nse_sast()` | NSE SAST | Corp announcements keyword filter (takeover/SAST) | 0-3 |
+| `scrape_nse_pledge()` | NSE Pledge | Corp announcements keyword filter (pledge) | 0-3 |
+| `scrape_nse_credit_ratings()` | NSE Rating Changes | Corp announcements keyword filter (CRISIL/ICRA/CARE) | 0-3 |
+| `scrape_bse_announcements()` | BSE Announcements | HTML scrape (limited — JS-dynamic) | 0 |
+| `scrape_bse_insider_trading()` | BSE Insider Trading | HTML scrape (limited — JS-dynamic) | 0 |
+| `scrape_sebi_orders()` | SEBI Orders | SEBI RSS feed (`/sebirss.xml`) | 30 |
+| `scrape_pib_releases()` | PIB Releases | HTML scrape of indexd.aspx | 15 |
+
+#### Master Collector
+| Function | Purpose |
+|----------|---------|
+| `collect_insider_news(config)` | Execute all 10 insider scrapers (each independent), URL dedup → ~33 unique articles |
 
 ---
 
@@ -226,7 +302,9 @@ DuckDuckGo Web ────────┘                              Diversit
 | `7e04ab3` | Jun 8, 00:06 | **Timezone fix + new sources.** Fixed `get_time_label()` to use IST (UTC+5:30), added Business Today, Inc42, SEBI, Investing.com India, improved NDTV (Feedburner) and Financial Express (HTML-only) scrapers, enhanced keyword scoring |
 | `64bc22e` | Jun 8, 00:16 | **BUG FIXES + PROJECT MEMORY.** (1) Gemini auth changed from `?key=` query param to `x-goog-api-key` header — 403 error was silently killing LLM ranking, so Gemini never actually worked before this fix. (2) Keyword fallback paths in `analyze_articles()` now respect `MIN_IMPACT_SCORE` filter. (3) Created `PROJECT_MEMORY.md`. |
 
-### Uncommitted Changes (none at present — all pushed)
+| `ce3c047` | Jun 10, 01:47 | **Insider News Pipeline.** Created `insider_scrapers.py` with 10 early-signal sources (NSE bulk/block deals, insider trading, SAST, pledge, credit ratings, BSE, SEBI orders, PIB). Added `INSIDER_ANALYSIS_PROMPT`, `analyze_insider_articles()`, dual-section `_format_message()` with 🔴 INSIDER NEWS + 📰 GENERAL NEWS. Updated `config.py` with `INSIDER_SOURCES`. Main orchestrator runs both pipelines in sequence. |
+
+### Uncommitted Changes (none at present)
 All changes committed and pushed to `origin/main`.
 
 ---
@@ -270,7 +348,33 @@ All changes committed and pushed to `origin/main`.
 - **GitHub verification:** Secrets confirmed present, Actions enabled, remote branch up to date
 - **Committed & pushed** as `64bc22e`, `33b2a17`
 
-### Key Decisions Made
+### Session 4: Insider News Pipeline (Jun 10, 01:37 IST)
+- **User goal:** Add early-signal exchange filings that publish BEFORE mainstream news
+- **Sources identified (10):** NSE bulk/block deals, insider trading, SAST, pledge, credit ratings, BSE announcements, BSE insider, SEBI orders, PIB releases
+- **Architecture:** Separate pipeline (`insider_scrapers.py`) → dedicated Gemini prompt → dual-section Telegram message
+- **Existing pipeline untouched** — General News code paths 100% preserved
+
+#### Key Technical Discoveries
+1. **NSE Bulk/Block Deals API**: `/api/snapshot-capital-market-largedeal` (NOT `/api/bulk-deals` which returns 404). Returns BULK_DEALS_DATA (141 items) and BLOCK_DEALS_DATA (9 items) in a single call.
+2. **NSE Insider/SAST/Pledge/Ratings**: No dedicated API endpoints exist (all 404). Extracted from `/api/corporate-announcements` by keyword filtering `attchmntText` field.
+3. **SEBI Orders**: HTML page is JS-dynamic (no table data in source). Switched to RSS feed `/sebirss.xml` which contains enforcement orders (30 items).
+4. **PIB RSS**: All RSS URLs return HTML (not XML). Switched to HTML scraping of `indexd.aspx` (15 items, Hindi-heavy).
+5. **BSE Announcements**: Pages are JavaScript-rendered. Limited data available via HTML scraping.
+
+#### Fixes Applied During Development
+6. **NSE corp announcements `type=` parameter**: Does not filter — all types return same data regardless of parameter value. Switched to keyword-based filtering on `attchmntText`.
+7. **PIB RSS malformed XML**: PIB's RSS endpoint serves HTML instead of XML. Bypassed and used HTML scrape instead.
+8. **Source priority mapping**: Extended to include all new insider sources (NSE Bulk Deal=9, SEBI Order=8, PIB Release=7, etc.)
+
+#### E2E Test Results (Jun 10, 01:46 IST via run_agent.sh)
+- ✅ **Insider scrapers:** NSE bulk(141) + block(9) + insider(1) + SEBI(30) + PIB(15) = 196 total → 33 unique
+- ✅ **Insider LLM:** Gemini ranked 23 articles (min score 5+) → top 10 selected
+- ✅ **General scrapers:** 1290 raw → 100 unique (unchanged from previous runs)
+- ✅ **General LLM:** Gemini ranked 29 articles (min score 6+) → 15 after diversity filter
+- ✅ **Telegram:** 4/4 messages sent — Section 1: INSIDER NEWS (10 items), Section 2: GENERAL NEWS (15 items)
+- ✅ **Pipeline time:** ~2 min total (within 10-min GH Actions limit)
+
+#### Key Decisions Made
 1. **Gemini 2.5 Flash Lite** chosen as LLM — free tier, 60 req/min, 1500 req/day
 2. **Two-pass ranking** — Keyword pre-filter (cheap) → Gemini (expensive but accurate on shortlist)
 3. **50-50 diversity split** — NSE filings vs media sources, index articles always included
@@ -278,6 +382,9 @@ All changes committed and pushed to `origin/main`.
 5. **NSE API** (`/api/corporate-announcements`) used instead of scraping NSE website
 6. **DuckDuckGo** for fallback web search (no API key needed)
 7. **GitHub Actions** preferred over local cron for 24/7 reliability
+8. **Separate insider module** (`insider_scrapers.py`) — keeps existing 1500-line main file untouched
+9. **Two Gemini prompts** — General prompt (stock/index types) + Insider prompt (insider_buy/sell/bulk_deal/regulatory types)
+10. **Newsletter-style UI** — 🔴 INSIDER NEWS section first (highest information value), then 📰 GENERAL NEWS
 
 ---
 
@@ -327,6 +434,17 @@ All changes committed and pushed to `origin/main`.
 - **Result:** Articles scoring as low as 1/10 could appear in Telegram output when LLM was unavailable
 - **Fix:** Added `_filter_by_min_score()` helper applied to all fallback return paths
 - **Note:** The LLM path already correctly filtered at line 1048-1049; this only affected fallback scenarios
+
+### BSE Scrapers Limited
+- BSE Corporate Announcements and BSE Insider Trading pages are JavaScript-dynamic
+- HTML scraping returns 0 items consistently
+- **Impact:** Companies listed ONLY on BSE (not NSE) are not covered by insider pipeline
+- **Mitigation:** NSE covers the vast majority of actively traded stocks; BSE-only coverage is a known gap
+
+### PIB RSS Broken
+- PIB RSS URLs (`RssMain.aspx`) return HTML instead of XML
+- HTML fallback (`indexd.aspx`) works but returns Hindi-heavy content
+- **Impact:** PIB releases in English may not be captured; Hindi content scores lower in Gemini ranking
 
 ### No README.md
 - Project lacks a standard README for GitHub visitors
