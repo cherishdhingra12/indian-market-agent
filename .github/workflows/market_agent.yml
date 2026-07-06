@@ -31,9 +31,10 @@ jobs:
 
       - name: Run Market News Agent
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          LLM_PROVIDER: gemini
-          LLM_MODEL: gemini-2.5-flash-lite
+          LLM_PROVIDER: groq
+          LLM_MODEL: llama-3.3-70b-versatile
+          LLM_API_BASE: https://api.groq.com/openai/v1/chat/completions
         run: python indian_market_agent.py

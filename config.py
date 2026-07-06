@@ -1,12 +1,13 @@
 import os
 from datetime import date
 
-# ─── LLM Configuration (Gemini — Free) ───────────────────────────────────────
-# Get a free API key at: https://aistudio.google.com/apikey
-# Gemini 2.0 Flash is free with 60 requests/minute, 1500 requests/day
-LLM_PROVIDER = "gemini"  # "gemini", "groq", "openai", "anthropic", or "none"
-LLM_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
-LLM_MODEL = "gemini-2.5-flash-lite"
+# ─── LLM Configuration (Groq — Free) ──────────────────────────────────────────
+# Get a free API key at: https://console.groq.com/keys
+# Groq offers Llama 3, Mixtral, and Gemma models on a generous free tier
+LLM_PROVIDER = "groq"  # "gemini", "groq", "openai", "anthropic", or "none"
+LLM_API_KEY = os.environ.get("GROQ_API_KEY", "YOUR_GROQ_API_KEY_HERE")
+LLM_API_BASE = "https://api.groq.com/openai/v1/chat/completions"
+LLM_MODEL = "llama-3.3-70b-versatile"
 LLM_TEMPERATURE = 0.2
 LLM_MAX_TOKENS = 8192
 
