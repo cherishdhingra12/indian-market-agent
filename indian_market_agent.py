@@ -1040,9 +1040,9 @@ def analyze_articles(articles: List[Dict], config: dict) -> List[Dict]:
     pre_scored.sort(key=lambda x: x.get("market_impact_score", 0), reverse=True)
     candidates = pre_scored[:35]
 
-    # Pass 2: Send only top candidates to LLM for intelligent ranking
+    # Pass 2: Send only top candidates to LLM for intelligent ranking (truncate url/snippet to fit free tier)
     articles_for_prompt = [
-        {"title": a["title"], "source": a["source"], "url": a.get("url", ""), "snippet": a.get("snippet", "")[:150]}
+        {"title": a["title"][:120], "source": a["source"], "url": a.get("url", "")[:80], "snippet": a.get("snippet", "")[:100]}
         for a in candidates
     ]
 
@@ -1310,7 +1310,7 @@ def analyze_insider_articles(articles: List[Dict], config: dict) -> List[Dict]:
     candidates = pre_scored[:25]
 
     articles_for_prompt = [
-        {"title": a["title"], "source": a["source"], "url": a.get("url", ""), "snippet": a.get("snippet", "")[:150]}
+        {"title": a["title"][:120], "source": a["source"], "url": a.get("url", "")[:80], "snippet": a.get("snippet", "")[:100]}
         for a in candidates
     ]
 
