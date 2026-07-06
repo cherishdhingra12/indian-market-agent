@@ -1038,7 +1038,7 @@ def analyze_articles(articles: List[Dict], config: dict) -> List[Dict]:
     # Pass 1: Score all articles with keywords, keep top candidates for LLM exploration
     pre_scored = _keyword_score(articles, 60)
     pre_scored.sort(key=lambda x: x.get("market_impact_score", 0), reverse=True)
-    candidates = pre_scored[:40]
+    candidates = pre_scored[:35]
 
     # Pass 2: Send only top candidates to LLM for intelligent ranking
     articles_for_prompt = [
@@ -1306,8 +1306,8 @@ def analyze_insider_articles(articles: List[Dict], config: dict) -> List[Dict]:
         return _filter_by_min_score(_keyword_score(articles, top_n))
 
     # Pre-filter: keyword score all articles, send top candidates to LLM for exploration
-    pre_scored = _keyword_score(articles, 40)
-    candidates = pre_scored[:30]
+    pre_scored = _keyword_score(articles, 30)
+    candidates = pre_scored[:25]
 
     articles_for_prompt = [
         {"title": a["title"], "source": a["source"], "url": a.get("url", ""), "snippet": a.get("snippet", "")[:150]}
