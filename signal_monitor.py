@@ -22,13 +22,24 @@ import signal
 from datetime import datetime, date, timezone, timedelta
 from typing import List, Dict, Optional, Set
 
+# Load .env for local credentials (before logging is set up)
+try:
+    from dotenv import load_dotenv
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if os.path.exists(env_path):
+        load_dotenv(env_path)
+except Exception:
+    pass
+
 import requests
 
 from alerts_db import init_db, was_notified, mark_notified, cleanup_old_entries, get_stats
 from deep_sources import (
     FNO_STOCKS, NIFTY_50, BANK_NIFTY,
     get_fno_oi_snapshots,
+    get_delivery_snapshots,
     scrape_india_vix,
+    scrape_fii_dii_flows,
     scrape_gift_nifty,
     scrape_usd_inr,
     get_bulk_block_deals,
@@ -41,6 +52,7 @@ from signal_rules import (
     classify_filing_impact, check_fno_ban,
     HIGH_IMPACT_FILING_CATS,
 )
+from predictor import run_predictor
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -97,7 +109,10 @@ def send_alert(signal: dict, config: dict) -> bool:
         log.warning("Telegram not configured")
         return False
 
-    msg = _format_alert(signal)
+    if signal.get("_format") == "predictive":
+        msg = _format_predictive(signal)
+    else:
+        msg = _format_alert(signal)
     if not msg:
         return False
 
@@ -223,6 +238,7 @@ prev = PreviousState()
 
 def poll_filings(config: dict):
     """Poll NSE corporate announcements for high-impact filings."""
+    global _pred_cache
     try:
         from indian_market_agent import scrape_nse_announcements
         filings = scrape_nse_announcements()
@@ -231,16 +247,22 @@ def poll_filings(config: dict):
         return
 
     stock_universe = set(FNO_STOCKS)
+    new_alerts = []
     for filing in filings:
         impact = classify_filing_impact(filing, stock_universe)
         if impact and impact.get("direction") != "neutral":
+            new_alerts.append(impact)
             process_and_alert([impact], config)
+
+    # Cache for predictor
+    _pred_cache["filing_alerts"] = new_alerts
 
     log.info(f"Filing poll: {len(filings)} checked")
 
 
 def poll_oi(config: dict):
     """Poll F&O OI data and detect buildups."""
+    global _pred_cache
     try:
         current = get_fno_oi_snapshots()
     except Exception as e:
@@ -250,13 +272,19 @@ def poll_oi(config: dict):
     if prev.oi:
         signals = check_oi_convergence(current, prev.oi)
         process_and_alert(signals, config)
+        # Cache for predictor
+        _pred_cache["oi_alerts"] = signals
+    else:
+        _pred_cache["oi_alerts"] = []
 
+    _pred_cache["oi_data"] = current
     prev.oi = current
     log.info(f"OI poll: {len(current)} stocks, alerts sent")
 
 
 def poll_deals(config: dict):
     """Poll bulk/block deals for F&O stocks."""
+    global _pred_cache
     try:
         deals = get_bulk_block_deals()
     except Exception as e:
@@ -277,17 +305,21 @@ def poll_deals(config: dict):
         })
 
     process_and_alert(alerts, config)
+    # Cache for predictor
+    _pred_cache["deals"] = deals
     log.info(f"Deal poll: {len(alerts)} significant deals")
 
 
 def poll_vix(config: dict):
     """Poll India VIX for fear/complacency."""
+    global _pred_cache
     try:
         vix = scrape_india_vix()
         fii = scrape_fii_dii_flows()
         usd = scrape_usd_inr()
         signals = check_index_signals(vix_data=vix, fii_data=fii, usd_inr=usd)
         process_and_alert(signals, config)
+        _pred_cache["index_signals"] = signals
     except Exception as e:
         log.error(f"VIX/FII poll failed: {e}")
 
@@ -304,22 +336,170 @@ def poll_premarket(config: dict):
 
 
 def poll_delivery(config: dict):
-    """Check delivery % at market close.
-    Note: delivery data source is currently unavailable (NSE blocked quote-equity).
-    This is a placeholder for when a working source becomes available.
-    """
-    pass
+    """Check delivery % from NSE bhavcopy (working via curl_cffi)."""
+    global _pred_cache
+    try:
+        snapshots = get_delivery_snapshots()
+        if not snapshots:
+            return
+        signals = check_delivery_spikes(snapshots)
+        process_and_alert(signals, config)
+        _pred_cache["delivery_snapshots"] = snapshots
+        _pred_cache["delivery_alerts"] = signals
+        log.info(f"Delivery poll: {len(signals)} signals from {len(snapshots)} stocks")
+    except Exception as e:
+        log.error(f"Delivery poll failed: {e}")
 
 
 def poll_fno_ban(config: dict):
     """Check for new F&O ban entries."""
+    global _pred_cache
     try:
         banned = scrape_fno_ban_list()
         signals = check_fno_ban(banned, prev.banned if prev.banned else None)
         process_and_alert(signals, config)
+        _pred_cache["banned"] = banned
         prev.banned = banned
     except Exception as e:
         log.error(f"F&O ban poll failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  Predictive Signal Polling
+# ─────────────────────────────────────────────────────────────────────
+
+# Cache: latest data from each poll, fed to predictor for convergence
+_pred_cache: dict = {
+    "oi_alerts": [],
+    "oi_data": {},
+    "deals": {"bulk": [], "block": []},
+    "filing_alerts": [],
+    "index_signals": [],
+    "banned": [],
+    "delivery_alerts": [],
+    "delivery_snapshots": {},
+    "ai_insights": [],
+}
+
+
+def _format_predictive(signal: dict) -> str:
+    """Format predictive ENTRY/EXIT/SURE_SHOT alerts with timing."""
+    sig_type = signal.get("signal", "PREDICTIVE")
+    action = signal.get("action", "")
+    symbol = signal.get("symbol", "")
+    confidence = signal.get("confidence", "MEDIUM")
+
+    header_icon = "🚨" if sig_type == "SURE_SHOT" else ("🟢" if action == "ENTRY" else "🔴")
+    header_label = "SURE SHOT" if sig_type == "SURE_SHOT" else f"PREDICTIVE {action}"
+
+    lines = [
+        f"{header_icon} <b>CONVERGENCE ALERT</b>",
+        "═" * 35,
+        f"<b>{symbol}</b> — {header_label}",
+        f"Confidence: {'🔥' if confidence == 'HIGH' else '⚡'} {confidence}",
+    ]
+
+    reasons = signal.get("reasons", [])
+    if reasons:
+        lines.append("")
+        for r in reasons[:4]:
+            lines.append(f"▸ {r}")
+
+    entry_hint = signal.get("entry_hint", "")
+    if entry_hint:
+        lines.append("")
+        lines.append(entry_hint)
+
+    exit_hint = signal.get("exit_hint", "")
+    if exit_hint:
+        lines.append("")
+        lines.append(exit_hint)
+
+    signal_types = signal.get("signal_types", [])
+    lines.append("")
+    lines.append(f"Sources: {', '.join(signal.get('sources', []))}")
+
+    now = ist_now()
+    lines.append(f"⏱ {now.strftime('%H:%M IST')}")
+
+    return "\n".join(lines)
+
+
+def poll_predictive(config: dict):
+    """Run the predictive convergence engine on all cached data."""
+    global _pred_cache
+    data = _pred_cache
+
+    oi_data = data.get("oi_data", {})
+    deals = data.get("deals", {"bulk": [], "block": []})
+    filing_alerts = data.get("filing_alerts", [])
+    index_signals = data.get("index_signals", [])
+    banned = data.get("banned", [])
+    oi_alerts = data.get("oi_alerts", [])
+    delivery_alerts = data.get("delivery_alerts", [])
+
+    if not oi_data and not delivery_alerts:
+        return
+
+    result = run_predictor(
+        oi_alerts=oi_alerts,
+        deals=deals,
+        filing_alerts=filing_alerts,
+        index_signals=index_signals,
+        oi_data=oi_data,
+        banned_stocks=banned,
+        delivery_alerts=delivery_alerts,
+        universe=set(FNO_STOCKS),
+    )
+
+    # Send SURE_SHOT alerts first (highest priority)
+    for alert in result.get("sure_shots", []):
+        if was_notified(alert["symbol"], "SURE_SHOT", alert):
+            continue
+        success = send_predictive_alert(alert, config)
+        if success:
+            mark_notified(alert["symbol"], "SURE_SHOT", alert)
+            time.sleep(1.5)
+
+    # Then ENTRY alerts
+    for alert in result.get("entries", []):
+        if was_notified(alert["symbol"], "PREDICTIVE_ENTRY", alert):
+            continue
+        success = send_predictive_alert(alert, config)
+        if success:
+            mark_notified(alert["symbol"], "PREDICTIVE_ENTRY", alert)
+            time.sleep(1.5)
+
+    # Then EXIT alerts
+    for alert in result.get("exits", []):
+        if was_notified(alert["symbol"], "PREDICTIVE_EXIT", alert):
+            continue
+        success = send_predictive_alert(alert, config)
+        if success:
+            mark_notified(alert["symbol"], "PREDICTIVE_EXIT", alert)
+            time.sleep(1.5)
+
+    # Sector rotation (lower priority)
+    for alert in result.get("sector_rotation", []):
+        if was_notified(alert["symbol"], "SECTOR_ROTATION", alert):
+            continue
+        success = send_predictive_alert(alert, config)
+        if success:
+            mark_notified(alert["symbol"], "SECTOR_ROTATION", alert)
+            time.sleep(1.5)
+
+    log.info(
+        f"Predictive: {len(result['entries'])} entries, "
+        f"{len(result['exits'])} exits, "
+        f"{len(result['sure_shots'])} sure shots, "
+        f"{len(result['sector_rotation'])} sector rotations"
+    )
+
+
+def send_predictive_alert(signal: dict, config: dict) -> bool:
+    """Send a predictive alert through the same Telegram bot as regular signals."""
+    signal["_format"] = "predictive"
+    return send_alert(signal, config)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -368,12 +548,14 @@ def main_loop(config: dict):
                 poll_filings(config)
                 poll_count += 1
 
-                # Every 15 min — OI, deals, ban list
+                # Every 15 min — OI, deals, ban list, delivery + predictive convergence
                 if minute % 15 == 0 and time.time() - last_oi_poll > 600:
                     log.info("--- OI/DEAL/BAN POLL ---")
                     poll_oi(config)
                     poll_deals(config)
                     poll_fno_ban(config)
+                    poll_delivery(config)
+                    poll_predictive(config)
                     last_oi_poll = time.time()
                     last_deals_poll = time.time()
                     last_ban_poll = time.time()

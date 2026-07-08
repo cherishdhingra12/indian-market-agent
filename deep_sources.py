@@ -95,21 +95,58 @@ def _nse_session() -> Optional[requests.Session]:
         return None
 
 
+def _nse_curl_session():
+    """
+    NSE-primed session using curl_cffi (real Chrome TLS fingerprint).
+
+    NSE's Akamai edge now 403s the default python-requests TLS handshake at the
+    homepage, which silently breaks every downstream API call. curl_cffi
+    impersonates Chrome and gets a 200 + valid cookies. Returns None if
+    curl_cffi is unavailable so callers can degrade gracefully.
+    """
+    try:
+        from curl_cffi import requests as curl_req
+    except Exception:
+        log.debug("curl_cffi unavailable — NSE API calls may be blocked")
+        return None
+    try:
+        s = curl_req.Session(impersonate="chrome124")
+        s.headers.update({
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/",
+        })
+        s.get("https://www.nseindia.com", timeout=15)
+        time.sleep(0.5)
+        return s
+    except Exception:
+        return None
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  1. F&O Option Chain — OI Data
 # ─────────────────────────────────────────────────────────────────────
 
-def scrape_option_chain_oi(symbol: str) -> Optional[Dict]:
-    """Fetch option chain for a stock and calculate aggregate OI metrics."""
-    session = _nse_session()
-    if not session:
+def scrape_option_chain_oi(symbol: str, session=None) -> Optional[Dict]:
+    """Fetch option chain for a stock and calculate aggregate OI metrics.
+
+    Note: NSE currently gates the option-chain-equities endpoint (returns an
+    empty payload even with a valid Chrome TLS session). When that happens we
+    return None so the caller stays silent rather than emitting fake OI signals.
+    Pass a shared curl_cffi ``session`` to avoid re-priming per symbol.
+    """
+    own_session = session is None
+    if own_session:
+        session = _nse_curl_session()
+    if session is None:
         return None
     try:
         resp = session.get(
             f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}",
             timeout=15,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            return None
         data = resp.json()
         records = data.get("records", {})
         strike_data = records.get("data", [])
@@ -143,21 +180,35 @@ def scrape_option_chain_oi(symbol: str) -> Optional[Dict]:
         log.debug(f"Option chain OI failed for {symbol}: {e}")
         return None
     finally:
-        session.close()
+        if own_session:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 
 def get_fno_oi_snapshots(symbols: List[str] = None) -> Dict[str, Dict]:
     if symbols is None:
         symbols = FNO_STOCKS
+    session = _nse_curl_session()
+    if session is None:
+        log.warning("F&O OI: no NSE session (curl_cffi unavailable)")
+        return {}
     results = {}
-    for i, symbol in enumerate(symbols):
-        data = scrape_option_chain_oi(symbol)
-        if data:
-            results[symbol] = data
-        if i > 0 and i % 10 == 0:
-            time.sleep(1)
-        else:
-            time.sleep(0.4)
+    try:
+        for i, symbol in enumerate(symbols):
+            data = scrape_option_chain_oi(symbol, session=session)
+            if data:
+                results[symbol] = data
+            if i > 0 and i % 10 == 0:
+                time.sleep(1)
+            else:
+                time.sleep(0.4)
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
     log.info(f"F&O OI snapshots: {len(results)}/{len(symbols)}")
     return results
 
@@ -196,9 +247,67 @@ def scrape_quote_equity(symbol: str) -> Optional[Dict]:
 
 
 def get_delivery_snapshots(symbols: List[str] = None) -> Dict[str, Dict]:
-    """NOT AVAILABLE — quote-equity API is blocked by NSE (returns 403).
-    This function is kept as a no-op placeholder for future use."""
-    return {}
+    """Fetch delivery % from NSE equity bhavcopy (working data source).
+    Uses curl_cffi for proper TLS fingerprint to bypass Akamai."""
+    if symbols is None:
+        symbols = FNO_STOCKS
+    try:
+        from curl_cffi import requests as curl_req
+        import csv, io
+
+        # Try yesterday first (today's bhavcopy not published until EOD)
+        for days_back in [1, 2, 0]:
+            d = (datetime.now() - timedelta(days=days_back)).date()
+            date_str = d.strftime('%d%m%Y')
+            url = f'https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv'
+            s = curl_req.Session(impersonate='chrome124')
+            resp = s.get(url, timeout=20)
+            if resp.status_code != 200 or len(resp.content) < 10000:
+                continue
+
+            content = resp.text
+            reader = csv.DictReader(io.StringIO(content), skipinitialspace=True)
+            symbol_set = set(s.upper() for s in symbols)
+            results = {}
+            for row in reader:
+                sym = row.get('SYMBOL', '').upper()
+                if sym not in symbol_set:
+                    continue
+                series = row.get('SERIES', '').strip()
+                if series not in ('EQ', 'BE', 'BZ'):
+                    continue
+                try:
+                    last_price = float(row.get('CLOSE_PRICE', 0) or 0)
+                    prev_close = float(row.get('PREV_CLOSE', 0) or 0)
+                    change = last_price - prev_close
+                    p_change = round(change / prev_close * 100, 2) if prev_close else 0
+                    total_qty = int(row.get('TTL_TRD_QNTY', 0) or 0)
+                    deliv_qty = int(row.get('DELIV_QTY', 0) or 0)
+                    delivery_pct = round(deliv_qty / total_qty * 100, 2) if total_qty else 0
+
+                    results[sym] = {
+                        "symbol": sym,
+                        "last_price": last_price,
+                        "change": round(change, 2),
+                        "p_change": p_change,
+                        "total_volume": total_qty,
+                        "delivery_pct": delivery_pct,
+                        "deliv_qty": deliv_qty,
+                        "total_qty": total_qty,
+                        "date": date_str,
+                    }
+                except (ValueError, TypeError):
+                    continue
+
+            if results:
+                log.info(f"Delivery snapshots: {len(results)} stocks from bhavcopy {date_str}")
+                return results
+
+        log.warning("No bhavcopy available for last 3 days")
+        return {}
+    except Exception as e:
+        log.warning(f"Bhavcopy delivery fetch failed: {e}")
+        return {}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -216,35 +325,40 @@ def scrape_fii_dii_flows() -> Optional[Dict]:
 # ─────────────────────────────────────────────────────────────────────
 
 def scrape_india_vix() -> Optional[Dict]:
-    """Fetch India VIX current value from NSE."""
-    session = _nse_session()
-    if not session:
+    """Fetch India VIX from NSE's allIndices endpoint.
+
+    The old chart-databyindex?index=INDIAVIX endpoint now returns empty data.
+    India VIX is still published in /api/allIndices as a regular index row,
+    which includes the live value and day change.
+    """
+    session = _nse_curl_session()
+    if session is None:
         return None
     try:
-        resp = session.get(
-            "https://www.nseindia.com/api/chart-databyindex?index=INDIAVIX",
-            timeout=15,
-        )
-        resp.raise_for_status()
+        resp = session.get("https://www.nseindia.com/api/allIndices", timeout=20)
+        if resp.status_code != 200:
+            return None
         data = resp.json()
-        series = data.get("grapthData", [])
-        if series and len(series) > 1:
-            latest = series[-1]
-            current = latest[1] if len(latest) > 1 else None
-            prev_close = data.get("closePrice")
-            if current and prev_close and prev_close > 0:
-                change_pct = round((current - prev_close) / prev_close * 100, 2)
+        for idx in data.get("data", []):
+            if "VIX" in (idx.get("index") or "").upper():
+                current = idx.get("last")
+                change_pct = idx.get("percentChange")
+                if current is None or change_pct is None:
+                    return None
                 return {
-                    "vix": current,
-                    "change_pct": change_pct,
-                    "direction": "up" if change_pct > 0 else "down",
+                    "vix": round(float(current), 2),
+                    "change_pct": round(float(change_pct), 2),
+                    "direction": "up" if float(change_pct) > 0 else "down",
                 }
         return None
     except Exception as e:
         log.debug(f"India VIX fetch failed: {e}")
         return None
     finally:
-        session.close()
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -321,20 +435,35 @@ def get_bulk_block_deals() -> Dict[str, List[Dict]]:
 # ─────────────────────────────────────────────────────────────────────
 
 def scrape_fno_ban_list() -> List[str]:
+    session = _nse_curl_session()
+    if session is None:
+        return []
     try:
-        resp = requests.get(
-            "https://www.nseindia.com/regulations/market/fo-securities-ban",
-            headers={"User-Agent": USER_AGENTS[0]},
-            timeout=10,
+        resp = session.get(
+            "https://www.nseindia.com/api/reportOI-SecuritiesBan",
+            timeout=15,
         )
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
         banned = []
-        for row in soup.select("table tr"):
-            cells = row.select("td")
-            if cells:
-                el = cells[0].select_one("a")
-                if el:
+        if resp.status_code == 200:
+            data = resp.json()
+            # API shape: {"data": ["SYMBOL1", "SYMBOL2", ...]} or list of dicts
+            rows = data.get("data", data) if isinstance(data, dict) else data
+            for row in rows or []:
+                sym = row if isinstance(row, str) else (row.get("symbol") or row.get("Symbol") or "")
+                sym = sym.strip().upper()
+                if sym and len(sym) <= 15 and sym.isalpha():
+                    banned.append(sym)
+        # Fallback: HTML regulations page
+        if not banned:
+            r2 = session.get(
+                "https://www.nseindia.com/regulations/market/fo-securities-ban",
+                timeout=15,
+            )
+            soup = BeautifulSoup(r2.text, "lxml")
+            for row in soup.select("table tr"):
+                cells = row.select("td")
+                if cells:
+                    el = cells[0].select_one("a") or cells[0]
                     sym = el.get_text(strip=True).upper()
                     if sym and len(sym) <= 15 and sym.isalpha():
                         banned.append(sym)
@@ -343,6 +472,11 @@ def scrape_fno_ban_list() -> List[str]:
     except Exception as e:
         log.debug(f"F&O ban list failed: {e}")
         return []
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────

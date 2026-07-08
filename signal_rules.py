@@ -151,46 +151,52 @@ def check_oi_convergence(
 
 def check_delivery_spikes(delivery_snapshots: Dict[str, Dict]) -> List[Dict]:
     """
-    Detect accumulation / distribution via delivery %:
-      - > 85% delivery = strong accumulation (bullish)
-      - < 30% delivery = speculative / distribution (bearish)
-      - > 10% change from previous day = notable shift
+    Detect accumulation / distribution from a single EOD bhavcopy:
+      - High delivery % (>=85%) + price up   = accumulation (bullish)
+      - Low delivery %  (<=30%) + price down = distribution (bearish)
+
+    Note: a single bhavcopy has no previous-day delivery %, so a genuine
+    day-over-day "delivery surge" cannot be computed from it. Direction and
+    magnitude use ``p_change`` (the real percent price move); the raw ``change``
+    field is rupees, not a percentage, and must not be printed as "%".
     """
     alerts = []
     for symbol, data in delivery_snapshots.items():
         delivery_pct = data.get("delivery_pct", 0) or 0
-        change = data.get("change", 0) or 0
+        p_change = data.get("p_change", 0) or 0
         total_qty = data.get("total_qty", 0) or 0
 
         if total_qty < 100000:
             continue
 
-        if delivery_pct >= DELIVERY_SPIKE_THRESHOLD and change > 0:
+        # Bhavcopy is previous-session EOD data — label it so a signal sent
+        # intraday isn't mistaken for a live tick.
+        raw_date = data.get("date", "")
+        if raw_date and len(raw_date) == 8:
+            src = f" [EOD bhavcopy {raw_date[:2]}-{raw_date[2:4]}-{raw_date[4:]}]"
+        else:
+            src = " [EOD bhavcopy]"
+
+        close_price = data.get("last_price", 0) or 0
+        if delivery_pct >= DELIVERY_SPIKE_THRESHOLD and p_change > 0:
             alerts.append({
                 "symbol": symbol,
                 "signal": "ACCUMULATION",
                 "confidence": "HIGH" if delivery_pct >= 90 else "MEDIUM",
                 "delivery_pct": delivery_pct,
-                "change": change,
-                "reason": f"Delivery {delivery_pct}% (+{change}%) — Strong hands accumulating",
+                "change": round(p_change, 2),
+                "last_price": close_price,
+                "reason": f"Delivery {delivery_pct}% + price {p_change:+.2f}% — Strong hands accumulating{src}",
             })
-        elif delivery_pct <= DELIVERY_DROP_THRESHOLD and change < 0:
+        elif delivery_pct <= DELIVERY_DROP_THRESHOLD and p_change < 0:
             alerts.append({
                 "symbol": symbol,
                 "signal": "DISTRIBUTION",
                 "confidence": "MEDIUM",
                 "delivery_pct": delivery_pct,
-                "change": change,
-                "reason": f"Delivery {delivery_pct}% ({change}%) — Weak hands / distribution",
-            })
-        elif change > 15:
-            alerts.append({
-                "symbol": symbol,
-                "signal": "DELIVERY_SURGE",
-                "confidence": "MEDIUM",
-                "delivery_pct": delivery_pct,
-                "change": change,
-                "reason": f"Delivery surged by {change}% to {delivery_pct}% — Notable change in holding pattern",
+                "change": round(p_change, 2),
+                "last_price": close_price,
+                "reason": f"Delivery {delivery_pct}% + price {p_change:+.2f}% — Weak hands / distribution{src}",
             })
 
     log.info(f"Delivery spikes: {len(alerts)} signals detected")
