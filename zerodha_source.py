@@ -113,23 +113,32 @@ def auto_login() -> Optional[str]:
                          "twofa_value": totp, "twofa_type": "totp"}, timeout=15)
         r.raise_for_status()
 
-        # Trigger the Connect login redirect; capture request_token from the
-        # redirect URL (the final hop to the app redirect_url may be unreachable,
-        # so read it from history/exception rather than requiring a live endpoint).
+        # Trigger the Connect login redirect and capture request_token from the
+        # Location header WITHOUT following redirects (the final hop to the app's
+        # redirect_url is unreachable from a server and would drop the token).
+        # Kite may issue several 302s; walk them manually until request_token
+        # appears, or a hop points off-domain (the app redirect_url).
         request_token = None
-        try:
-            resp = s.get(f"https://kite.zerodha.com/connect/login?api_key={key}&v=3",
-                         allow_redirects=True, timeout=15)
-            for h in list(resp.history) + [resp]:
-                q = parse_qs(urlparse(h.url).query)
+        url = f"https://kite.zerodha.com/connect/login?api_key={key}&v=3"
+        for _ in range(6):
+            resp = s.get(url, allow_redirects=False, timeout=15)
+            # token can appear in the current URL's query or the redirect target
+            for candidate in (url, resp.headers.get("location", "")):
+                q = parse_qs(urlparse(candidate).query)
                 if "request_token" in q:
-                    request_token = q["request_token"][0]; break
-        except Exception as e:
-            q = parse_qs(urlparse(str(getattr(e, "request", "") ) or "").query)
-            if "request_token" in q:
-                request_token = q["request_token"][0]
+                    request_token = q["request_token"][0]
+                    break
+            if request_token:
+                break
+            loc = resp.headers.get("location")
+            if not loc:
+                break
+            # resolve relative redirects against the kite host
+            url = loc if loc.startswith("http") else f"https://kite.zerodha.com{loc}"
         if not request_token:
-            log.error("Kite auto-login: could not capture request_token")
+            log.error("Kite auto-login: could not capture request_token "
+                      "(login/2FA ok — check API app 'redirect URL' is set in the "
+                      "Kite developer console)")
             return None
 
         kc = KiteConnect(api_key=key)
