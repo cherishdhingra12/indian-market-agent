@@ -190,6 +190,20 @@ def scrape_option_chain_oi(symbol: str, session=None) -> Optional[Dict]:
 def get_fno_oi_snapshots(symbols: List[str] = None) -> Dict[str, Dict]:
     if symbols is None:
         symbols = FNO_STOCKS
+
+    # Preferred: LIVE OI via Zerodha Kite (real-time futures OI + price). Only
+    # used when Kite creds are configured; otherwise fall back to the NSE scrape
+    # (which NSE currently gates → empty, i.e. honestly silent).
+    try:
+        import zerodha_source as kite
+        if kite.available():
+            snaps = kite.get_oi_snapshots(symbols, indices=kite.INDEX_ROOTS)
+            if snaps:
+                return snaps
+            log.warning("Kite configured but returned no OI — falling back to NSE scrape")
+    except Exception as e:
+        log.warning(f"Kite OI source unavailable ({e}); falling back to NSE scrape")
+
     session = _nse_curl_session()
     if session is None:
         log.warning("F&O OI: no NSE session (curl_cffi unavailable)")
