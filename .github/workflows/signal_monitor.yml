@@ -45,9 +45,31 @@ jobs:
           restore-keys: |
             alerts-db-
 
+      # Compute today's IST date so the Kite token cache is keyed per trading day.
+      - name: IST date
+        id: ist
+        run: echo "date=$(TZ=Asia/Kolkata date +%F)" >> "$GITHUB_OUTPUT"
+
+      # Cache the daily Kite access token. First run of the day = miss -> the bot
+      # auto-logs-in (TOTP) and writes .kite_token, which is saved under today's
+      # key; later runs hit the cache and reuse the token (no repeated logins).
+      - name: Restore Kite token (daily)
+        uses: actions/cache@v4
+        with:
+          path: .kite_token
+          key: kite-token-${{ steps.ist.outputs.date }}
+
       - name: Run one poll pass
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          # Zerodha Kite — live F&O OI. API app creds + autonomous login (TOTP).
+          # Add these as repo secrets; leave unset to run without live OI.
+          KITE_API_KEY: ${{ secrets.KITE_API_KEY }}
+          KITE_API_SECRET: ${{ secrets.KITE_API_SECRET }}
+          KITE_USER_ID: ${{ secrets.KITE_USER_ID }}
+          KITE_PASSWORD: ${{ secrets.KITE_PASSWORD }}
+          KITE_TOTP_SECRET: ${{ secrets.KITE_TOTP_SECRET }}
         run: python signal_monitor.py --once
+

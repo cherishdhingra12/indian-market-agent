@@ -20,11 +20,14 @@ Helpers: `login_url()` prints the login link; `exchange_token(request_token)`
 swaps the one-time request_token for a daily access_token.
 """
 import os
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 log = logging.getLogger(__name__)
+
+_TOKEN_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".kite_token")
 
 # Index futures we also want buildup signals on (Kite tradingsymbols use these roots)
 INDEX_ROOTS = ["NIFTY", "BANKNIFTY"]
@@ -43,17 +46,119 @@ _fut_map: Dict[str, str] = {}   # symbol -> current-month FUT tradingsymbol
 _token_map: Dict[str, int] = {}  # "NFO:TRADINGSYMBOL" -> instrument_token (unused for quote())
 
 
-def _creds() -> Optional[dict]:
-    k = os.environ.get("KITE_API_KEY", "")
-    t = os.environ.get("KITE_ACCESS_TOKEN", "")
-    if not k or not t or "YOUR_" in k or "YOUR_" in t:
+def _ist_today() -> str:
+    return (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+
+
+def _login_creds() -> Optional[dict]:
+    """Credentials for autonomous auto-login (user id, password, TOTP secret)."""
+    uid = os.environ.get("KITE_USER_ID", "")
+    pwd = os.environ.get("KITE_PASSWORD", "")
+    totp = os.environ.get("KITE_TOTP_SECRET", "")
+    if uid and pwd and totp and "YOUR_" not in uid:
+        return {"user_id": uid, "password": pwd, "totp_secret": totp}
+    return None
+
+
+def _cached_token() -> Optional[str]:
+    """Return today's cached access_token if present (Kite tokens last one day)."""
+    try:
+        with open(_TOKEN_CACHE) as f:
+            d = json.load(f)
+        if d.get("date") == _ist_today() and d.get("access_token"):
+            return d["access_token"]
+    except Exception:
+        pass
+    return None
+
+
+def _save_token(tok: str):
+    try:
+        with open(_TOKEN_CACHE, "w") as f:
+            json.dump({"date": _ist_today(), "access_token": tok}, f)
+    except Exception as e:
+        log.warning(f"Could not cache Kite token: {e}")
+
+
+def auto_login() -> Optional[str]:
+    """Generate a fresh access_token via Zerodha login + TOTP (no manual step).
+
+    Uses the same endpoints the browser login uses:
+      1. POST /api/login (user_id + password) -> request_id
+      2. POST /api/twofa (request_id + current TOTP) -> authenticated session
+      3. GET connect/login -> redirects with request_token
+      4. exchange request_token + api_secret -> access_token
+    Needs KITE_USER_ID, KITE_PASSWORD, KITE_TOTP_SECRET, KITE_API_KEY/SECRET.
+    """
+    lc = _login_creds()
+    key = os.environ.get("KITE_API_KEY", "")
+    secret = os.environ.get("KITE_API_SECRET", "")
+    if not lc or not key or not secret:
         return None
-    return {"api_key": k, "access_token": t}
+    try:
+        import requests
+        import pyotp
+        from urllib.parse import urlparse, parse_qs
+        from kiteconnect import KiteConnect
+
+        s = requests.Session()
+        r = s.post("https://kite.zerodha.com/api/login",
+                   data={"user_id": lc["user_id"], "password": lc["password"]}, timeout=15)
+        r.raise_for_status()
+        request_id = r.json()["data"]["request_id"]
+
+        totp = pyotp.TOTP(lc["totp_secret"]).now()
+        r = s.post("https://kite.zerodha.com/api/twofa",
+                   data={"user_id": lc["user_id"], "request_id": request_id,
+                         "twofa_value": totp, "twofa_type": "totp"}, timeout=15)
+        r.raise_for_status()
+
+        # Trigger the Connect login redirect; capture request_token from the
+        # redirect URL (the final hop to the app redirect_url may be unreachable,
+        # so read it from history/exception rather than requiring a live endpoint).
+        request_token = None
+        try:
+            resp = s.get(f"https://kite.zerodha.com/connect/login?api_key={key}&v=3",
+                         allow_redirects=True, timeout=15)
+            for h in list(resp.history) + [resp]:
+                q = parse_qs(urlparse(h.url).query)
+                if "request_token" in q:
+                    request_token = q["request_token"][0]; break
+        except Exception as e:
+            q = parse_qs(urlparse(str(getattr(e, "request", "") ) or "").query)
+            if "request_token" in q:
+                request_token = q["request_token"][0]
+        if not request_token:
+            log.error("Kite auto-login: could not capture request_token")
+            return None
+
+        kc = KiteConnect(api_key=key)
+        sess = kc.generate_session(request_token, api_secret=secret)
+        tok = sess["access_token"]
+        _save_token(tok)
+        log.info("Kite auto-login succeeded; access_token refreshed")
+        return tok
+    except Exception as e:
+        log.error(f"Kite auto-login failed: {e}")
+        return None
+
+
+def _access_token() -> Optional[str]:
+    """Resolve today's access token: explicit env > cache > auto-login."""
+    t = os.environ.get("KITE_ACCESS_TOKEN", "")
+    if t and "YOUR_" not in t:
+        return t
+    return _cached_token() or auto_login()
 
 
 def available() -> bool:
-    """True only if Kite creds are present — lets callers fall back cleanly."""
-    return _creds() is not None
+    """True if we have (or can obtain) live Kite access — lets callers fall back."""
+    key = os.environ.get("KITE_API_KEY", "")
+    if not key or "YOUR_" in key:
+        return False
+    # A usable token via env/cache, OR the ability to auto-login.
+    return bool(_access_token()) if (os.environ.get("KITE_ACCESS_TOKEN")
+                                     or _cached_token()) else (_login_creds() is not None)
 
 
 def _client():
@@ -61,13 +166,14 @@ def _client():
     global _kite
     if _kite is not None:
         return _kite
-    c = _creds()
-    if not c:
+    key = os.environ.get("KITE_API_KEY", "")
+    tok = _access_token()
+    if not key or "YOUR_" in key or not tok:
         return None
     try:
         from kiteconnect import KiteConnect
-        kc = KiteConnect(api_key=c["api_key"])
-        kc.set_access_token(c["access_token"])
+        kc = KiteConnect(api_key=key)
+        kc.set_access_token(tok)
         _kite = kc
         return kc
     except Exception as e:
