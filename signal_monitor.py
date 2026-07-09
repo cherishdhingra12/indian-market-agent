@@ -605,9 +605,53 @@ def main_loop(config: dict):
             time.sleep(60)
 
 
+def run_once(config: dict):
+    """Execute ONE poll pass and exit — for stateless cloud (GitHub Actions) runs.
+
+    Collapses the daemon's time-gated schedule into a single cycle: pre-market
+    check when applicable, and the full market-hours poll set otherwise. Runs
+    nothing (a clean no-op) outside market/pre-market windows so off-schedule
+    cron fires are harmless. Dedup DB persistence between runs is handled by the
+    caller (the workflow caches alerts.db).
+    """
+    log.info("=" * 60)
+    log.info("NSE Signal Monitor — single pass (--once)")
+    now = ist_now()
+    log.info(f"IST {now.strftime('%Y-%m-%d %H:%M:%S')} | open={is_market_open()} "
+             f"premarket={is_premarket()} postmarket={is_postmarket()}")
+
+    init_db()
+    cleanup_old_entries(days=3)
+
+    if is_premarket():
+        log.info("--- PRE-MARKET CHECK ---")
+        poll_premarket(config)
+
+    if is_market_open():
+        # One full sweep. Order matters: OI/deals/delivery populate _pred_cache
+        # that poll_predictive consumes; filings feed it too.
+        poll_filings(config)
+        log.info("--- OI/DEAL/BAN POLL ---")
+        poll_oi(config)
+        poll_deals(config)
+        poll_fno_ban(config)
+        poll_delivery(config)
+        log.info("--- VIX/FII POLL ---")
+        poll_vix(config)
+        poll_predictive(config)
+    elif not is_premarket():
+        log.info("Outside market/pre-market window — nothing to poll.")
+
+    stats = get_stats()
+    log.info(f"Single pass complete — {stats['total_signals']} total alerts fired to date")
+
+
 def main():
     config = load_config()
-    main_loop(config)
+    if "--once" in sys.argv:
+        run_once(config)
+    else:
+        main_loop(config)
 
 
 if __name__ == "__main__":

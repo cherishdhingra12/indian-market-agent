@@ -1,0 +1,53 @@
+name: NSE Signal Monitor (live)
+
+# Runs one poll pass every 15 min during Indian market hours, so the bot no
+# longer depends on a Mac being awake. The daemon mode (signal_monitor.py with
+# no args) still works locally as a fallback.
+on:
+  schedule:
+    # Every 15 min, 02:30–10:15 UTC, Mon–Fri.
+    # 02:30 UTC = 08:00 IST (pre-market) … 10:15 UTC = 15:45 IST (post-close delivery).
+    # signal_monitor.py --once self-guards with is_market_open()/is_premarket(),
+    # so fires outside 9:15–15:30 IST are harmless no-ops.
+    - cron: '*/15 2-10 * * 1-5'
+  workflow_dispatch: {}   # manual trigger for testing
+
+# Never let two runs overlap — the dedup DB is read-modify-write single state.
+concurrency:
+  group: nse-signal-monitor
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Persist the dedup DB across runs. Unique key per run guarantees the save
+      # succeeds; restore-keys pulls the most recent previous alerts.db so the
+      # same-day dedup memory carries forward. (cleanup keeps only ~3 days.)
+      - name: Restore alerts.db (dedup state)
+        uses: actions/cache@v4
+        with:
+          path: alerts.db
+          key: alerts-db-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            alerts-db-
+
+      - name: Run one poll pass
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python signal_monitor.py --once
