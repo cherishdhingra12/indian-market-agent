@@ -646,9 +646,40 @@ def run_once(config: dict):
     log.info(f"Single pass complete — {stats['total_signals']} total alerts fired to date")
 
 
+def check_kite(config: dict):
+    """Connectivity self-test — verifies autonomous Kite auto-login + live OI,
+    independent of market hours (quote() returns last-known OI even when closed).
+    Prints a clear PASS/FAIL without ever exposing the token."""
+    log.info("=" * 60)
+    log.info("Kite connectivity self-test (--check)")
+    try:
+        import zerodha_source as kite
+        if not kite.available():
+            log.error("KITE CHECK: not configured / cannot obtain a token "
+                      "(need KITE_API_KEY/SECRET + USER_ID/PASSWORD/TOTP_SECRET, "
+                      "or a valid KITE_ACCESS_TOKEN)")
+            return
+        from deep_sources import FNO_STOCKS
+        snaps = kite.get_oi_snapshots(list(FNO_STOCKS), indices=kite.INDEX_ROOTS)
+        if snaps:
+            sample = list(snaps)[:3]
+            log.info(f"KITE CHECK: PASS — live OI for {len(snaps)} symbols. "
+                     f"Sample: {', '.join(sample)}")
+            for s in sample:
+                d = snaps[s]
+                log.info(f"    {s}: OI={d['total_oi']:,} price={d['underlying_value']}")
+        else:
+            log.error("KITE CHECK: token OK but no OI returned (check API "
+                      "subscription / instruments)")
+    except Exception as e:
+        log.error(f"KITE CHECK: FAILED — {e}")
+
+
 def main():
     config = load_config()
-    if "--once" in sys.argv:
+    if "--check" in sys.argv:
+        check_kite(config)
+    elif "--once" in sys.argv:
         run_once(config)
     else:
         main_loop(config)

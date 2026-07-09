@@ -10,7 +10,14 @@ on:
     # signal_monitor.py --once self-guards with is_market_open()/is_premarket(),
     # so fires outside 9:15–15:30 IST are harmless no-ops.
     - cron: '*/15 2-10 * * 1-5'
-  workflow_dispatch: {}   # manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode: 'once' (normal poll) or 'check' (Kite self-test)"
+        required: false
+        default: once
+        type: choice
+        options: [once, check]
 
 # Never let two runs overlap — the dedup DB is read-modify-write single state.
 concurrency:
@@ -71,5 +78,5 @@ jobs:
           KITE_USER_ID: ${{ secrets.KITE_USER_ID }}
           KITE_PASSWORD: ${{ secrets.KITE_PASSWORD }}
           KITE_TOTP_SECRET: ${{ secrets.KITE_TOTP_SECRET }}
-        run: python signal_monitor.py --once
+        run: python signal_monitor.py --${{ github.event.inputs.mode || 'once' }}
 
