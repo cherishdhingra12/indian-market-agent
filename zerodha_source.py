@@ -29,6 +29,15 @@ log = logging.getLogger(__name__)
 # Index futures we also want buildup signals on (Kite tradingsymbols use these roots)
 INDEX_ROOTS = ["NIFTY", "BANKNIFTY"]
 
+# Bot symbol -> Kite/NSE futures "name" where they differ (renames / punctuation).
+# Symbols with NO current F&O future (dropped from the F&O list) are simply not
+# mapped and skipped: TATAMOTORS, BERGEPAINT.
+SYMBOL_ALIASES = {
+    "BAJAJAUTO": "BAJAJ-AUTO",
+    "ADANITRANS": "ADANIENSOL",   # renamed Adani Energy Solutions
+    "TORPHARMA": "TORNTPHARM",    # Torrent Pharma
+}
+
 _kite = None                 # cached KiteConnect client
 _fut_map: Dict[str, str] = {}   # symbol -> current-month FUT tradingsymbol
 _token_map: Dict[str, int] = {}  # "NFO:TRADINGSYMBOL" -> instrument_token (unused for quote())
@@ -82,22 +91,28 @@ def _current_month_futures(kc, symbols: List[str]) -> Dict[str, str]:
         log.error(f"Kite instruments() failed: {e}")
         return {}
     want = set(s.upper() for s in symbols)
+    # Map Kite's futures "name" back to the bot's symbol (via aliases where they differ)
+    alias_to_sym = {}
+    for s in want:
+        alias_to_sym[SYMBOL_ALIASES.get(s, s)] = s
+    match_names = set(alias_to_sym)
     today = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).date()
-    best: Dict[str, tuple] = {}   # sym -> (expiry_date, tradingsymbol)
+    best: Dict[str, tuple] = {}   # bot_sym -> (expiry_date, tradingsymbol)
     for ins in instruments:
         if ins.get("instrument_type") != "FUT":
             continue
         name = (ins.get("name") or "").upper()
-        if name not in want:
+        if name not in match_names:
             continue
+        sym = alias_to_sym[name]      # back to the bot's symbol
         exp = ins.get("expiry")
         if not exp:
             continue
         exp_d = exp if hasattr(exp, "year") else datetime.strptime(str(exp), "%Y-%m-%d").date()
         if exp_d < today:
             continue
-        if name not in best or exp_d < best[name][0]:
-            best[name] = (exp_d, ins["tradingsymbol"])
+        if sym not in best or exp_d < best[sym][0]:
+            best[sym] = (exp_d, ins["tradingsymbol"])
     _fut_map = {sym: ts for sym, (_, ts) in best.items()}
     log.info(f"Kite: mapped {len(_fut_map)} current-month futures")
     return _fut_map
